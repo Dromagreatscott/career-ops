@@ -19,6 +19,7 @@ import { tmpdir } from 'os';
 import {
   classifyDuplicate,
   decide,
+  evaluateJob,
   getJob,
   ingest,
   normalizeSourceFile,
@@ -112,6 +113,84 @@ advertised_comp: "$210000-$260000 USD"
 \`\`\`
 `, 'utf-8');
   return file;
+}
+
+function writeFakeEvaluator(root, mode = 'success', score = 4.6) {
+  const file = join(root, `fake-evaluator-${mode}.mjs`);
+  let report = '';
+  if (mode === 'unparseable') {
+    report = 'not a Career Ops report';
+  } else if (mode === 'missing-score') {
+    report = '# Evaluation: SyntheticCo — Director of AI\\n\\n## Strongest Evidence\\n- Career Ops rationale without a score\\n';
+  } else if (mode === 'conflict') {
+    report = '# Evaluation: WrongCo — Director of AI\\n\\n**Company:** WrongCo\\n**Role:** Director of AI\\n**Score:** 4.2/5\\n\\n---SCORE_SUMMARY---\\nCOMPANY: WrongCo\\nROLE: Director of AI\\nSCORE: 4.2\\nARCHETYPE: AI Transformation\\nLEGITIMACY: High Confidence\\n---END_SUMMARY---\\n';
+  } else {
+    report = `# Evaluation: SyntheticCo — Director of AI
+
+**Company:** SyntheticCo
+**Role:** Director of AI
+**Score:** ${score}/5
+**Archetype:** AI Transformation
+**Legitimacy:** High Confidence
+**Recommendation:** strong apply
+
+## Machine Summary
+\`\`\`yaml
+company: SyntheticCo
+role: Director of AI
+advertised_comp: "$210000-$260000 USD"
+\`\`\`
+
+## Strongest Evidence
+- Production AI automation programs
+- Executive stakeholder communication
+
+## Evidence Gaps
+- Enterprise governance metrics
+
+## Hard Mismatches
+- None
+
+## B) Match with CV
+Career Ops rationale: strong applied AI leadership alignment.
+
+---SCORE_SUMMARY---
+COMPANY: SyntheticCo
+ROLE: Director of AI
+SCORE: ${score}
+ARCHETYPE: AI Transformation
+LEGITIMACY: High Confidence
+---END_SUMMARY---
+`;
+  }
+  writeFileSync(file, `#!/usr/bin/env node
+import { mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
+
+const mode = ${JSON.stringify(mode)};
+if (mode === 'failure') {
+  console.error('synthetic evaluator failure');
+  process.exit(7);
+}
+
+mkdirSync('reports', { recursive: true });
+const reportPath = join('reports', '099-syntheticco-2026-08-02.md');
+const report = ${JSON.stringify(report)};
+writeFileSync(reportPath, report, 'utf-8');
+console.log(\`✅  Report saved: \${reportPath}\`);
+console.log(report);
+`, 'utf-8');
+  return file;
+}
+
+function ingestSynthetic(root) {
+  writeProfile(root);
+  writeInbox(root, 'synthetic.md', directorTxt.replaceAll('Acme AI', 'SyntheticCo').replace('https://jobs.example.test/acme/director-ai', 'https://example.test/jobs/director-ai'));
+  return ingest({ root }).results[0].job_id;
+}
+
+function auditLines(root) {
+  return readFileSync(join(root, 'data', 'hawkeye', 'audit.jsonl'), 'utf-8').trim().split('\n').filter(Boolean);
 }
 
 const longDescription = `We need a senior applied AI leader to build production workflow automation, agent orchestration, operational dashboards, API integrations, and executive AI transformation programs. `.repeat(10);
@@ -413,6 +492,222 @@ ${'Own executive AI implementation, dashboards, and transformation. '.repeat(20)
     const second = ingest({ root });
     eq('idempotent repeated ingestion keeps job count stable', second.jobs_total, first.jobs_total);
     eq('repeated ingestion reports duplicate', second.results[0].deduplication_status, 'exact_duplicate');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'success', 4.6);
+    const result = evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    const job = getJob(id, { root });
+    eq('successful evaluation handoff marks Career Ops evaluated', result.evaluation.status, 'career_ops_evaluated');
+    eq('canonical 1-5 score preserved after evaluation', job.evaluation.canonical_score, 4.6);
+    eq('score scale remains 1-5', job.evaluation.score_scale, '1-5');
+    eq('evidence preservation from Career Ops report', job.evaluation.strongest_evidence[0], 'Production AI automation programs');
+    eq('evidence gap preservation from Career Ops report', job.evaluation.evidence_gaps[0], 'Enterprise governance metrics');
+    eq('shortlist recomputes strong after canonical score', shortlist({ root }).strong[0].job_id, id);
+    ok('evaluation report path attached', job.evaluation.report_path.endsWith('reports/099-syntheticco-2026-08-02.md'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    writeProfile(root);
+    const result = await runCli(['evaluate', 'missing-id'], root);
+    eq('missing job ID fails closed', result.code, 1);
+    ok('missing job ID error is clear', result.stderr.includes('Unknown Hawkeye job ID'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const job = getJob(id, { root });
+    rmSync(join(root, job.evaluation.reference), { force: true });
+    const fake = writeFakeEvaluator(root, 'success');
+    let threw = false;
+    try {
+      evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    } catch (err) {
+      threw = err.message.includes('JD file is missing');
+    }
+    ok('missing JD fails closed', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'failure');
+    let threw = false;
+    try {
+      evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    } catch (err) {
+      threw = err.message.includes('Career Ops evaluation failed');
+    }
+    ok('evaluator failure fails closed', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'unparseable');
+    let threw = false;
+    try {
+      evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    } catch (err) {
+      threw = err.message.includes('canonical 1-5 score');
+    }
+    ok('unparseable result fails closed', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'missing-score');
+    let threw = false;
+    try {
+      evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    } catch (err) {
+      threw = err.message.includes('canonical 1-5 score');
+    }
+    ok('missing score fails closed', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'conflict');
+    let threw = false;
+    try {
+      evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    } catch (err) {
+      threw = err.message.includes('conflicts with Hawkeye job company');
+    }
+    ok('conflicting evaluation fails closed', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'success', 4.6);
+    evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    const before = auditLines(root).length;
+    const second = evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    const after = auditLines(root).length;
+    eq('idempotent reevaluation skips unchanged inputs', second.skipped, true);
+    eq('idempotent reevaluation does not append duplicate audit', after, before);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'success', 4.6);
+    evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    ingest({ root });
+    eq('repeated ingestion preserves attached Career Ops score', getJob(id, { root }).evaluation.canonical_score, 4.6);
+    eq('repeated ingestion preserves evaluated status', getJob(id, { root }).evaluation.status, 'career_ops_evaluated');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'success', 4.6);
+    evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    const before = auditLines(root).length;
+    const job = getJob(id, { root });
+    writeFileSync(join(root, job.evaluation.reference), `${readFileSync(join(root, job.evaluation.reference), 'utf-8')}\nAdditional changed JD input.\n`, 'utf-8');
+    const reevaluated = evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    const after = auditLines(root).length;
+    eq('reevaluation after changed input is not skipped', reevaluated.skipped, false);
+    ok('reevaluation after changed input appends audit', after === before + 1);
+    ok('prior evaluation reference preserved', Boolean(getJob(id, { root }).evaluation.previous_evaluation_reference));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'success', 4.2);
+    evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    const job = getJob(id, { root });
+    ok('no 0-100 conversion field is present', !('presentation_score' in job.evaluation) && !('score_100' in job.evaluation));
+    ok('canonical score remains on 1-5 scale', job.evaluation.canonical_score <= 5);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const blockedPackage = await runCli(['evaluate', id, '--evaluator', 'node generate-pdf.mjs --file {jd}'], root);
+    eq('package generation evaluator is blocked', blockedPackage.code, 1);
+    ok('package generation blocked before execution', blockedPackage.stderr.includes('not allowed'));
+    const blockedPortal = await runCli(['evaluate', id, '--evaluator', 'node browser-extract.mjs {jd}'], root);
+    eq('browser/portal evaluator is blocked', blockedPortal.code, 1);
+    ok('browser automation blocked before execution', blockedPortal.stderr.includes('not allowed'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'success', 4.6);
+    const beforeFetch = globalThis.fetch;
+    globalThis.fetch = () => {
+      throw new Error('network should not be called by Hawkeye bridge');
+    };
+    try {
+      const result = evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+      eq('no network/Gmail/browser/portal access during synthetic evaluation bridge', result.ok, true);
+    } finally {
+      globalThis.fetch = beforeFetch;
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

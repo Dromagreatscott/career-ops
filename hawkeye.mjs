@@ -9,6 +9,7 @@
  */
 
 import { createHash } from 'crypto';
+import { execFileSync } from 'child_process';
 import {
   appendFileSync,
   existsSync,
@@ -32,6 +33,7 @@ const DEFAULT_INBOX_DIR = 'data/hawkeye/inbox';
 const JOBS_FILE = 'jobs.json';
 const AUDIT_FILE = 'audit.jsonl';
 const JDS_DIR = 'jds';
+const DEFAULT_EVALUATOR_TEMPLATE = 'node openai-eval.mjs --file {jd}';
 const DECISIONS = new Set(['approve', 'reject', 'watch', 'research']);
 const UNAVAILABLE = 'unavailable';
 const EXTRACTED = 'extracted';
@@ -51,6 +53,7 @@ const FORBIDDEN_COMMANDS = new Set([
 function usage() {
   return `Usage:
   node hawkeye.mjs ingest [--inbox <dir>] [--data-dir <dir>] [--actor <name>]
+  node hawkeye.mjs evaluate <job-id> [--evaluator <command-template>] [--force] [--data-dir <dir>]
   node hawkeye.mjs shortlist [--data-dir <dir>]
   node hawkeye.mjs show <job-id> [--data-dir <dir>]
   node hawkeye.mjs decide <job-id> <approve|reject|watch|research> [--reason <text>] [--actor <name>] [--data-dir <dir>]
@@ -582,6 +585,128 @@ function parseReportSummary(content, file, root = ROOT) {
   };
 }
 
+function scoreFromText(text) {
+  const summary = String(text || '').match(/---SCORE_SUMMARY---\s*([\s\S]*?)---END_SUMMARY---/);
+  const summaryScore = summary?.[1]?.match(/^\s*SCORE:\s*([0-9]+(?:\.[0-9]+)?)\s*$/im)?.[1];
+  const scoreText = summaryScore
+    || String(text || '').match(/\*\*Score:\*\*\s*([0-9]+(?:\.[0-9]+)?)\/5/i)?.[1]
+    || String(text || '').match(/^\s*score:\s*([0-9]+(?:\.[0-9]+)?)/im)?.[1];
+  const score = scoreText == null ? null : Number(scoreText);
+  return Number.isFinite(score) && score >= 0 && score <= 5 ? score : null;
+}
+
+function fieldFromScoreSummary(text, key) {
+  const summary = String(text || '').match(/---SCORE_SUMMARY---\s*([\s\S]*?)---END_SUMMARY---/);
+  const match = summary?.[1]?.match(new RegExp(`^\\s*${key}:\\s*(.+?)\\s*$`, 'im'));
+  return match ? match[1].trim() : '';
+}
+
+function firstReportPathFromOutput(output) {
+  const match = String(output || '').match(/\breports\/[A-Za-z0-9._/-]+\.md\b/);
+  return match ? match[0] : '';
+}
+
+function reportSnapshot(root) {
+  const reportsDir = resolve(root, 'reports');
+  const snapshot = new Map();
+  if (!existsSync(reportsDir)) return snapshot;
+  for (const name of readdirSync(reportsDir)) {
+    if (!name.endsWith('.md')) continue;
+    const full = resolve(reportsDir, name);
+    const stat = statSync(full);
+    snapshot.set(`reports/${name}`, `${stat.size}:${stat.mtimeMs}`);
+  }
+  return snapshot;
+}
+
+function changedReports(root, before) {
+  const reportsDir = resolve(root, 'reports');
+  if (!existsSync(reportsDir)) return [];
+  return readdirSync(reportsDir)
+    .filter((name) => name.endsWith('.md'))
+    .map((name) => {
+      const full = resolve(reportsDir, name);
+      const stat = statSync(full);
+      const rel = `reports/${name}`;
+      return { rel, full, stat, key: `${stat.size}:${stat.mtimeMs}` };
+    })
+    .filter((report) => before.get(report.rel) !== report.key)
+    .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+}
+
+function sectionBody(text, headingPatterns) {
+  const lines = String(text || '').split('\n');
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const heading = lines[i].match(/^#{1,4}\s+(.+)$/)?.[1]?.toLowerCase() || '';
+    if (heading && headingPatterns.some((pattern) => pattern.test(heading))) {
+      start = i + 1;
+      break;
+    }
+  }
+  if (start === -1) return '';
+  const body = [];
+  for (let i = start; i < lines.length; i++) {
+    if (/^#{1,4}\s+/.test(lines[i])) break;
+    body.push(lines[i]);
+  }
+  return body.join('\n').trim();
+}
+
+function bulletsFromSection(text, headingPatterns) {
+  const body = sectionBody(text, headingPatterns);
+  return [...body.matchAll(/^\s*[-*]\s+(.+)$/gm)]
+    .map((match) => match[1].trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function fallbackRationale(text) {
+  const block = sectionBody(text, [/match with cv/, /\bb\).*match/, /rationale/, /summary/]);
+  return block.split('\n').map((line) => line.trim()).filter(Boolean).slice(0, 8);
+}
+
+function parseCareerOpsEvaluation(content, reportPath = '') {
+  const score = scoreFromText(content);
+  if (score == null) throw new Error('Career Ops evaluation output has no canonical 1-5 score.');
+  const company = fieldFromScoreSummary(content, 'COMPANY')
+    || parseSimpleYamlScalars(sectionBody(content, [/machine summary/])).company
+    || String(content).match(/\*\*Company:\*\*\s*(.+)$/im)?.[1]?.trim()
+    || '';
+  const role = fieldFromScoreSummary(content, 'ROLE')
+    || parseSimpleYamlScalars(sectionBody(content, [/machine summary/])).role
+    || String(content).match(/\*\*Role:\*\*\s*(.+)$/im)?.[1]?.trim()
+    || '';
+  const archetype = fieldFromScoreSummary(content, 'ARCHETYPE')
+    || String(content).match(/\*\*Archetype:\*\*\s*(.+)$/im)?.[1]?.trim()
+    || '';
+  const legitimacy = fieldFromScoreSummary(content, 'LEGITIMACY')
+    || String(content).match(/\*\*Legitimacy:\*\*\s*(.+)$/im)?.[1]?.trim()
+    || '';
+  const explicitRecommendation = String(content).match(/\*\*Recommendation:\*\*\s*(.+)$/im)?.[1]?.trim()
+    || String(content).match(/^Recommendation:\s*(.+)$/im)?.[1]?.trim()
+    || '';
+  const strongestEvidence = bulletsFromSection(content, [/strongest evidence/, /top strengths/, /\bstrengths\b/, /match with cv/]);
+  const evidenceGaps = bulletsFromSection(content, [/evidence gaps/, /soft gaps/, /\bgaps\b/, /hard stops/]);
+  const hardMismatches = bulletsFromSection(content, [/hard mismatches/, /hard stops/, /blockers/, /red flags/])
+    .filter((line) => !/^none\.?$/i.test(line));
+  return {
+    company,
+    role,
+    canonical_score: score,
+    score_scale: '1-5',
+    archetype,
+    legitimacy,
+    explicit_recommendation: explicitRecommendation,
+    strongest_evidence: strongestEvidence.length ? strongestEvidence : fallbackRationale(content),
+    evidence_gaps: evidenceGaps,
+    hard_mismatches: hardMismatches,
+    career_ops_rationale: fallbackRationale(content),
+    report_path: reportPath,
+    report_sha256: sha256(content),
+  };
+}
+
 function stripQuotes(value) {
   return String(value ?? '').trim().replace(/^["']|["']$/g, '');
 }
@@ -645,6 +770,207 @@ function buildEvaluation(root, dataDir, job) {
   };
 }
 
+function readIfExists(root, relPath) {
+  const full = resolve(root, relPath);
+  return existsSync(full) ? readFileSync(full, 'utf-8') : '';
+}
+
+function evaluationInputHash(root, jdPath, evaluatorTemplate) {
+  const parts = [
+    readFileSync(jdPath, 'utf-8'),
+    readIfExists(root, 'cv.md'),
+    readIfExists(root, 'config/profile.yml'),
+    readIfExists(root, 'modes/_profile.md'),
+    readIfExists(root, 'modes/_custom.md'),
+    evaluatorTemplate,
+  ];
+  return sha256(parts.join('\n---hawkeye-input-boundary---\n'));
+}
+
+function splitCommandTemplate(template) {
+  const args = [];
+  let current = '';
+  let quote = null;
+  let escaped = false;
+  for (const char of String(template || '')) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      else current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+    } else if (/\s/.test(char)) {
+      if (current) {
+        args.push(current);
+        current = '';
+      }
+    } else {
+      current += char;
+    }
+  }
+  if (quote) throw new Error('Evaluator command has an unterminated quote.');
+  if (escaped) current += '\\';
+  if (current) args.push(current);
+  if (args.length === 0) throw new Error('Evaluator command is empty.');
+  return args;
+}
+
+function resolveEvaluatorCommand(template, root, job, jdPath) {
+  const rendered = String(template)
+    .replaceAll('{jd}', jdPath)
+    .replaceAll('{job_id}', job.job_id);
+  const parts = splitCommandTemplate(rendered);
+  const executable = parts[0] === 'node' ? process.execPath : parts[0];
+  const args = parts.slice(1);
+  const commandText = [parts[0], ...args].join(' ');
+  const forbidden = [
+    'generate-pdf.mjs',
+    'generate-cover-letter.mjs',
+    'prepare-application.mjs',
+    'application-answers.mjs',
+    'browser-extract.mjs',
+    'scan.mjs',
+    'scan-ats-full.mjs',
+    'gmail',
+    'submit',
+    'portal',
+  ];
+  if (forbidden.some((token) => commandText.toLowerCase().includes(token.toLowerCase()))) {
+    throw new Error(`Evaluator command is not allowed for Hawkeye evaluation bridge: ${tokenFromForbidden(commandText, forbidden)}`);
+  }
+  return { executable, args, commandText, cwd: root };
+}
+
+function tokenFromForbidden(commandText, forbidden) {
+  return forbidden.find((token) => commandText.toLowerCase().includes(token.toLowerCase())) || 'external action';
+}
+
+function validateEvaluationIdentity(parsed, job) {
+  const company = parsed.company && parsed.company.toLowerCase() !== 'unknown' ? parsed.company : '';
+  const role = parsed.role && parsed.role.toLowerCase() !== 'unknown' ? parsed.role : '';
+  const jobCompany = job.fields.company.value || '';
+  const jobTitle = job.fields.title.value || '';
+  if (company && jobCompany && !sameCompany(company, jobCompany)) {
+    throw new Error(`Career Ops evaluation company "${company}" conflicts with Hawkeye job company "${jobCompany}".`);
+  }
+  if (role && jobTitle && role !== jobTitle && !roleFuzzyMatch(role, jobTitle)) {
+    throw new Error(`Career Ops evaluation role "${role}" conflicts with Hawkeye job title "${jobTitle}".`);
+  }
+}
+
+function recommendationFromCareerOps(score, hardMismatches, explicitRecommendation = '') {
+  const explicit = explicitRecommendation.toLowerCase();
+  if (hardMismatches.length) return 'reject';
+  if (/\b(reject|do not apply|against applying|no apply)\b/.test(explicit)) return 'reject';
+  if (/\bwatch|research|exceptional review|conditional\b/.test(explicit)) return 'watch';
+  return recommendationFor(score, hardMismatches);
+}
+
+export function evaluateJob(jobId, {
+  root = ROOT,
+  dataDir = DEFAULT_DATA_DIR,
+  evaluator = process.env.CAREER_OPS_HAWKEYE_EVALUATOR || DEFAULT_EVALUATOR_TEMPLATE,
+  actor = 'local-user',
+  force = false,
+  timeoutMs = 300000,
+} = {}) {
+  const state = loadState(root, dataDir);
+  const job = state.jobs.find((item) => item.job_id === jobId);
+  if (!job) throw new Error(`Unknown Hawkeye job ID: ${jobId}`);
+  const currentReference = job.evaluation?.reference || '';
+  const jdRel = job.evaluation?.jd_path
+    || (currentReference && !currentReference.startsWith('reports/') ? currentReference : join(dataDir, JDS_DIR, `${job.job_id}.md`));
+  const jdPath = resolve(root, jdRel);
+  if (!existsSync(jdPath)) throw new Error(`Hawkeye JD file is missing: ${jdRel}`);
+  const inputHash = evaluationInputHash(root, jdPath, evaluator);
+  if (!force && job.evaluation?.status === 'career_ops_evaluated' && job.evaluation?.input_hash === inputHash) {
+    return { ok: true, skipped: true, reason: 'unchanged evaluation inputs', job_id: job.job_id, evaluation: job.evaluation };
+  }
+  const command = resolveEvaluatorCommand(evaluator, root, job, jdPath);
+  const reportsBefore = reportSnapshot(root);
+  let stdout = '';
+  try {
+    stdout = execFileSync(command.executable, command.args, {
+      cwd: command.cwd,
+      encoding: 'utf-8',
+      timeout: Number(timeoutMs) || 300000,
+      env: {
+        ...process.env,
+        HAWKEYE_JOB_ID: job.job_id,
+        HAWKEYE_JD_FILE: jdPath,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    throw new Error(`Career Ops evaluation failed: ${err.stderr?.toString()?.trim() || err.message}`);
+  }
+  const reportRelFromOutput = firstReportPathFromOutput(stdout);
+  const reportCandidate = reportRelFromOutput
+    ? { rel: reportRelFromOutput, full: resolve(root, reportRelFromOutput) }
+    : changedReports(root, reportsBefore)[0];
+  const reportRel = reportCandidate?.rel || '';
+  const reportPath = reportCandidate?.full || '';
+  const reportContent = reportPath && existsSync(reportPath) ? readFileSync(reportPath, 'utf-8') : stdout;
+  if (!reportContent.trim()) throw new Error('Career Ops evaluation produced no parseable output.');
+  const parsed = parseCareerOpsEvaluation(reportContent, reportRel);
+  validateEvaluationIdentity(parsed, job);
+  const profile = loadProfile(root);
+  const previousReference = job.evaluation?.report_path || (currentReference.startsWith('reports/') ? currentReference : '');
+  const previousHash = job.evaluation?.input_hash || '';
+  job.evaluation = {
+    status: 'career_ops_evaluated',
+    evaluation_status: 'career_ops_evaluated',
+    canonical_score: parsed.canonical_score,
+    score_scale: parsed.score_scale,
+    tier: classifyTier(job.fields.title.value || ''),
+    archetype: parsed.archetype || null,
+    legitimacy: parsed.legitimacy || null,
+    role_alignment: roleAlignment(job, profile),
+    compensation: compensationResult(job, profile),
+    location: locationResult(job, profile),
+    strongest_evidence: parsed.strongest_evidence,
+    evidence_gaps: parsed.evidence_gaps,
+    hard_mismatches: parsed.hard_mismatches.length ? parsed.hard_mismatches : hardMismatches(job),
+    recommendation: recommendationFromCareerOps(parsed.canonical_score, parsed.hard_mismatches, parsed.explicit_recommendation),
+    report_path: parsed.report_path || null,
+    reference: jdRel,
+    jd_path: jdRel,
+    evaluator_command: command.commandText,
+    evaluation_command: command.commandText,
+    evaluator_version: 'career-ops-1-5',
+    version: 'career-ops-1-5',
+    evaluated_at: nowIso(),
+    input_hash: inputHash,
+    report_sha256: parsed.report_sha256,
+    career_ops_rationale: parsed.career_ops_rationale,
+    previous_evaluation_reference: previousReference || null,
+  };
+  saveState(root, dataDir, state);
+  appendAudit(root, dataDir, {
+    event: 'evaluation',
+    job_id: job.job_id,
+    prior_state: previousHash ? 'career_ops_evaluated' : 'pending_career_ops_evaluation',
+    new_state: 'career_ops_evaluated',
+    actor,
+    reason: previousHash && previousHash !== inputHash ? 'reevaluation after changed inputs' : 'career-ops evaluation attached',
+    source_file: relative(root, job.source_file),
+    evaluation_reference: job.evaluation.report_path || job.evaluation.reference,
+    previous_evaluation_reference: previousReference,
+    canonical_score: job.evaluation.canonical_score,
+  });
+  return { ok: true, skipped: false, job_id: job.job_id, evaluation: job.evaluation };
+}
+
 function hardMismatches(job) {
   const text = `${job.fields.title.value || ''}\n${job.description}`.toLowerCase();
   const mismatches = [];
@@ -665,6 +991,7 @@ function recommendationFor(score, mismatches = []) {
   if (score == null) return 'watch';
   if (score >= 4.5) return 'strong';
   if (score >= 4.0) return 'good';
+  if (score >= 3.5) return 'watch';
   return 'reject';
 }
 
@@ -674,6 +1001,7 @@ function groupFor(job) {
   if (score == null) return 'watch';
   if (score >= 4.5) return 'strong';
   if (score >= 4.0) return 'good';
+  if (score >= 3.5) return 'watch';
   return 'reject';
 }
 
@@ -709,7 +1037,9 @@ export function ingest({ root = ROOT, inboxDir = DEFAULT_INBOX_DIR, dataDir = DE
       });
     } else if (existing) {
       existing.deduplication = dedup;
-      existing.evaluation = buildEvaluation(root, dataDir, existing);
+      if (existing.evaluation?.status !== 'career_ops_evaluated' || existing.source_sha256 !== candidate.source_sha256) {
+        existing.evaluation = buildEvaluation(root, dataDir, existing);
+      }
       stored = existing;
     }
     const sourceHashAfter = sha256(readFileSync(file, 'utf-8'));
@@ -777,7 +1107,7 @@ export function decide(jobId, newState, { root = ROOT, dataDir = DEFAULT_DATA_DI
     actor,
     reason,
     source_file: relative(root, job.source_file),
-    evaluation_reference: job.evaluation?.reference || '',
+    evaluation_reference: job.evaluation?.report_path || job.evaluation?.reference || '',
     note: newState === 'approve' ? 'Approved for later application-package preparation only; not approval to apply or submit.' : '',
   });
   return job.decision;
@@ -828,6 +1158,18 @@ export async function runCli(argv = process.argv.slice(2), root = process.cwd())
   try {
     if (cmd === 'ingest') {
       const result = ingest({ root, dataDir, inboxDir: args.inbox || DEFAULT_INBOX_DIR, actor: args.actor || 'local-user' });
+      return { code: 0, stdout: JSON.stringify(result, null, 2), stderr: '' };
+    }
+    if (cmd === 'evaluate') {
+      if (!first) throw new Error('evaluate requires <job-id>.');
+      const result = evaluateJob(first, {
+        root,
+        dataDir,
+        evaluator: args.evaluator || process.env.CAREER_OPS_HAWKEYE_EVALUATOR || DEFAULT_EVALUATOR_TEMPLATE,
+        actor: args.actor || 'local-user',
+        force: Boolean(args.force),
+        timeoutMs: args.timeoutMs || 300000,
+      });
       return { code: 0, stdout: JSON.stringify(result, null, 2), stderr: '' };
     }
     if (cmd === 'shortlist') {
