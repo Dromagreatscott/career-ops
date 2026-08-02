@@ -183,6 +183,92 @@ console.log(report);
   return file;
 }
 
+function writeFakeOpenAiEvaluator(root, mode = 'success', score = 4.6) {
+  const file = join(root, 'openai-eval.mjs');
+  const report = `# Evaluation: SyntheticCo — Director of AI
+
+**Company:** SyntheticCo
+**Role:** Director of AI
+**Score:** ${score}/5
+**Archetype:** AI Transformation
+**Legitimacy:** High Confidence
+**Recommendation:** strong apply
+
+## Strongest Evidence
+- NVIDIA-backed Career Ops evaluation
+
+## Evidence Gaps
+- Verified enterprise governance metric
+
+---SCORE_SUMMARY---
+COMPANY: SyntheticCo
+ROLE: Director of AI
+SCORE: ${score}
+ARCHETYPE: AI Transformation
+LEGITIMACY: High Confidence
+---END_SUMMARY---
+`;
+  const invalidReport = `# Evaluation: SyntheticCo — Director of AI
+
+**Company:** SyntheticCo
+**Role:** Director of AI
+
+---SCORE_SUMMARY---
+COMPANY: SyntheticCo
+ROLE: Director of AI
+ARCHETYPE: AI Transformation
+LEGITIMACY: High Confidence
+---END_SUMMARY---
+`;
+  writeFileSync(file, `#!/usr/bin/env node
+import { mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
+
+const mode = ${JSON.stringify(mode)};
+if (mode === 'timeout') {
+  await new Promise(() => {});
+} else if (mode === 'quota') {
+  console.error('HTTP 429 rate limit for key ' + process.env.OPENAI_API_KEY);
+  process.exit(1);
+} else if (mode === 'server') {
+  console.error('HTTP 503 temporarily unavailable');
+  process.exit(1);
+}
+
+const url = process.argv[process.argv.indexOf('--url') + 1] || '';
+const model = process.argv[process.argv.indexOf('--model') + 1] || '';
+const key = process.env.OPENAI_API_KEY || '';
+if (!key) {
+  console.error('OPENAI_API_KEY missing');
+  process.exit(1);
+}
+if (url !== 'https://integrate.api.nvidia.com/v1') {
+  console.error('unexpected url ' + url);
+  process.exit(1);
+}
+if (model !== 'nvidia/llama-3.3-nemotron-super-49b-v1.5') {
+  console.error('unexpected model ' + model);
+  process.exit(1);
+}
+
+mkdirSync('reports', { recursive: true });
+const reportPath = join('reports', '100-syntheticco-2026-08-02.md');
+const report = mode === 'invalid-score' ? ${JSON.stringify(invalidReport)} : ${JSON.stringify(report)};
+writeFileSync(reportPath, report, 'utf-8');
+writeFileSync('provider-observed.json', JSON.stringify({
+  provider_key_present: Boolean(key),
+  provider_key_expected: key === 'unit-test-nvidia-secret',
+  openai_key_present: Boolean(process.env.OPENAI_API_KEY),
+  nvidia_key_present: Boolean(process.env.NVIDIA_API_KEY),
+  base_url: url,
+  model,
+}, null, 2));
+console.log('Report saved: ' + reportPath);
+console.log(report);
+`, 'utf-8');
+  return file;
+}
+
 function ingestSynthetic(root) {
   writeProfile(root);
   writeInbox(root, 'synthetic.md', directorTxt.replaceAll('Acme AI', 'SyntheticCo').replace('https://jobs.example.test/acme/director-ai', 'https://example.test/jobs/director-ai'));
@@ -610,6 +696,238 @@ ${'Own executive AI implementation, dashboards, and transformation. '.repeat(20)
       threw = err.message.includes('conflicts with Hawkeye job company');
     }
     ok('conflicting evaluation fails closed', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    writeFakeOpenAiEvaluator(root, 'success', 4.7);
+    const env = { NVIDIA_API_KEY: 'unit-test-nvidia-secret' };
+    const result = evaluateJob(id, {
+      root,
+      env,
+      hermesEnvPath: join(root, 'missing.env'),
+      hermesConfigPath: join(root, 'missing.yaml'),
+    });
+    const job = getJob(id, { root });
+    const observed = JSON.parse(readFileSync(join(root, 'provider-observed.json'), 'utf-8'));
+    eq('NVIDIA provider selected by default', job.evaluation.evaluator_provider, 'nvidia-nim');
+    eq('NVIDIA base URL host recorded without secret', job.evaluation.evaluator_base_url_hostname, 'integrate.api.nvidia.com');
+    eq('NVIDIA model recorded', job.evaluation.evaluator_model, 'nvidia/llama-3.3-nemotron-super-49b-v1.5');
+    eq('NVIDIA key inherited as OpenAI-compatible child key', observed.provider_key_expected, true);
+    eq('canonical 1-5 score preserved for NVIDIA policy', result.evaluation.canonical_score, 4.7);
+    eq('NVIDIA policy keeps paid fallback disabled', job.evaluation.evaluator_paid_allowed, false);
+    ok('NVIDIA audit metadata contains no secret', !auditLines(root).join('\n').includes('unit-test-nvidia-secret'));
+    ok('NVIDIA job record contains no secret', !JSON.stringify(job).includes('unit-test-nvidia-secret'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    writeFakeOpenAiEvaluator(root, 'success');
+    let threw = false;
+    try {
+      evaluateJob(id, { root, env: {}, hermesEnvPath: join(root, 'missing.env'), hermesConfigPath: join(root, 'missing.yaml') });
+    } catch (err) {
+      threw = err.message.includes('NVIDIA_API_KEY is required');
+    }
+    ok('missing NVIDIA_API_KEY fails closed', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    writeFakeOpenAiEvaluator(root, 'success');
+    let threw = false;
+    try {
+      evaluateJob(id, {
+        root,
+        env: { NVIDIA_API_KEY: 'unit-test-nvidia-secret' },
+        provider: 'openai',
+        hermesEnvPath: join(root, 'missing.env'),
+        hermesConfigPath: join(root, 'missing.yaml'),
+      });
+    } catch (err) {
+      threw = err.message.includes('not approved');
+    }
+    ok('unapproved provider fails closed', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    writeFakeOpenAiEvaluator(root, 'success');
+    let threw = false;
+    try {
+      evaluateJob(id, {
+        root,
+        env: { NVIDIA_API_KEY: 'unit-test-nvidia-secret' },
+        model: '',
+        hermesEnvPath: join(root, 'missing.env'),
+        hermesConfigPath: join(root, 'missing.yaml'),
+      });
+    } catch (err) {
+      threw = err.message.includes('NVIDIA NIM model is required');
+    }
+    ok('missing NVIDIA model fails closed', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    writeFakeOpenAiEvaluator(root, 'success');
+    let threw = false;
+    try {
+      evaluateJob(id, {
+        root,
+        env: { NVIDIA_API_KEY: 'unit-test-nvidia-secret' },
+        baseUrl: 'https://api.openai.com/v1',
+        hermesEnvPath: join(root, 'missing.env'),
+        hermesConfigPath: join(root, 'missing.yaml'),
+      });
+    } catch (err) {
+      threw = err.message.includes('Paid OpenAI fallback is blocked');
+    }
+    ok('api.openai.com fallback blocked', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    writeFakeOpenAiEvaluator(root, 'success');
+    let threw = false;
+    try {
+      evaluateJob(id, {
+        root,
+        env: { NVIDIA_API_KEY: 'unit-test-nvidia-secret' },
+        allowPaid: 'true',
+        hermesEnvPath: join(root, 'missing.env'),
+        hermesConfigPath: join(root, 'missing.yaml'),
+      });
+    } catch (err) {
+      threw = err.message.includes('Paid fallback remains disabled');
+    }
+    ok('paid fallback request blocked', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    writeFakeOpenAiEvaluator(root, 'success');
+    let threw = false;
+    try {
+      evaluateJob(id, {
+        root,
+        env: {
+          NVIDIA_API_KEY: 'unit-test-nvidia-secret',
+          CAREER_OPS_HAWKEYE_EVALUATOR: 'node openai-eval.mjs --file {jd}',
+        },
+        hermesEnvPath: join(root, 'missing.env'),
+        hermesConfigPath: join(root, 'missing.yaml'),
+      });
+    } catch (err) {
+      threw = err.message.includes('explicit approved --url');
+    }
+    ok('OpenAI-compatible evaluator without approved URL fails closed', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    writeFakeOpenAiEvaluator(root, 'invalid-score');
+    let threw = false;
+    try {
+      evaluateJob(id, {
+        root,
+        env: { NVIDIA_API_KEY: 'unit-test-nvidia-secret' },
+        hermesEnvPath: join(root, 'missing.env'),
+        hermesConfigPath: join(root, 'missing.yaml'),
+      });
+    } catch (err) {
+      threw = err.message.includes('canonical 1-5 score');
+    }
+    ok('invalid provider score fails closed', threw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    writeFakeOpenAiEvaluator(root, 'quota');
+    let secretLeaked = false;
+    let rateFailed = false;
+    try {
+      evaluateJob(id, {
+        root,
+        env: { NVIDIA_API_KEY: 'unit-test-nvidia-secret' },
+        hermesEnvPath: join(root, 'missing.env'),
+        hermesConfigPath: join(root, 'missing.yaml'),
+      });
+    } catch (err) {
+      rateFailed = err.message.includes('Career Ops evaluation failed');
+      secretLeaked = err.message.includes('unit-test-nvidia-secret');
+    }
+    ok('quota/rate-limit failure fails closed', rateFailed);
+    eq('quota/rate-limit error redacts secret', secretLeaked, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    writeFakeOpenAiEvaluator(root, 'timeout');
+    let threw = false;
+    try {
+      evaluateJob(id, {
+        root,
+        env: { NVIDIA_API_KEY: 'unit-test-nvidia-secret' },
+        timeoutMs: 10,
+        maxRetries: 0,
+        hermesEnvPath: join(root, 'missing.env'),
+        hermesConfigPath: join(root, 'missing.yaml'),
+      });
+    } catch (err) {
+      threw = /timed out|ETIMEDOUT|SIGTERM/i.test(err.message);
+    }
+    ok('provider timeout fails closed', threw);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

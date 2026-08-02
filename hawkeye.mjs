@@ -33,7 +33,11 @@ const DEFAULT_INBOX_DIR = 'data/hawkeye/inbox';
 const JOBS_FILE = 'jobs.json';
 const AUDIT_FILE = 'audit.jsonl';
 const JDS_DIR = 'jds';
-const DEFAULT_EVALUATOR_TEMPLATE = 'node openai-eval.mjs --file {jd}';
+const DEFAULT_PROVIDER = 'nvidia-nim';
+const DEFAULT_NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1';
+const DEFAULT_NVIDIA_MODEL = 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
+const DEFAULT_TIMEOUT_MS = 300000;
+const DEFAULT_MAX_RETRIES = 1;
 const DECISIONS = new Set(['approve', 'reject', 'watch', 'research']);
 const UNAVAILABLE = 'unavailable';
 const EXTRACTED = 'extracted';
@@ -53,7 +57,7 @@ const FORBIDDEN_COMMANDS = new Set([
 function usage() {
   return `Usage:
   node hawkeye.mjs ingest [--inbox <dir>] [--data-dir <dir>] [--actor <name>]
-  node hawkeye.mjs evaluate <job-id> [--evaluator <command-template>] [--force] [--data-dir <dir>]
+  node hawkeye.mjs evaluate <job-id> [--evaluator <command-template>] [--provider nvidia-nim] [--model <id>] [--base-url <url>] [--force] [--data-dir <dir>]
   node hawkeye.mjs shortlist [--data-dir <dir>]
   node hawkeye.mjs show <job-id> [--data-dir <dir>]
   node hawkeye.mjs decide <job-id> <approve|reject|watch|research> [--reason <text>] [--actor <name>] [--data-dir <dir>]
@@ -775,6 +779,130 @@ function readIfExists(root, relPath) {
   return existsSync(full) ? readFileSync(full, 'utf-8') : '';
 }
 
+function parseBool(value, fallback = false) {
+  if (value == null || value === '') return fallback;
+  return /^(1|true|yes|on)$/i.test(String(value));
+}
+
+function parsePositiveInt(value, fallback) {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+function parseRetryCount(value, fallback) {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 ? n : fallback;
+}
+
+function readEnvValue(filePath, key) {
+  if (!filePath || !existsSync(filePath)) return '';
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = readFileSync(filePath, 'utf-8').match(new RegExp(`^\\s*${escaped}\\s*=\\s*(.*)\\s*$`, 'm'));
+  if (!match) return '';
+  return match[1].trim().replace(/^(['"])(.*)\1$/, '$2');
+}
+
+function readHermesModelConfig(filePath) {
+  if (!filePath || !existsSync(filePath)) return {};
+  const out = {};
+  let inModel = false;
+  for (const raw of readFileSync(filePath, 'utf-8').split('\n')) {
+    const line = raw.replace(/\s+#.*$/, '');
+    if (/^\s*model:\s*$/.test(line)) {
+      inModel = true;
+      continue;
+    }
+    if (inModel && /^\S/.test(line)) break;
+    if (!inModel) continue;
+    const match = line.match(/^\s{2,}(default|base_url|provider):\s*(.+?)\s*$/);
+    if (!match) continue;
+    if (match[1] === 'default') out.model = stripQuotes(match[2]);
+    if (match[1] === 'base_url') out.baseUrl = stripQuotes(match[2]);
+    if (match[1] === 'provider') out.hermesProvider = stripQuotes(match[2]);
+  }
+  return out;
+}
+
+function firstConfiguredValue(values, fallback) {
+  for (const value of values) {
+    if (value !== undefined && value !== null) return stripQuotes(value);
+  }
+  return fallback;
+}
+
+function redactSecrets(text, secrets = []) {
+  let out = String(text || '');
+  for (const secret of secrets.filter(Boolean)) {
+    out = out.split(secret).join('[REDACTED]');
+  }
+  return out
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, 'Bearer [REDACTED]')
+    .replace(/(OPENAI_API_KEY|NVIDIA_API_KEY|Authorization)\s*[:=]\s*[^\s]+/gi, '$1=[REDACTED]');
+}
+
+function hostFromUrl(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return '';
+  }
+}
+
+function renderProviderEvaluator(policy) {
+  return `node openai-eval.mjs --url ${policy.baseUrl} --model ${policy.model} --file {jd}`;
+}
+
+function resolveProviderPolicy({
+  root = ROOT,
+  env = process.env,
+  provider,
+  baseUrl,
+  model,
+  allowPaid,
+  timeoutMs,
+  maxRetries,
+  hermesEnvPath = env.CAREER_OPS_HAWKEYE_HERMES_ENV || '/root/.hermes/.env',
+  hermesConfigPath = env.CAREER_OPS_HAWKEYE_HERMES_CONFIG || '/root/.hermes/config.yaml',
+} = {}) {
+  const hermes = readHermesModelConfig(hermesConfigPath);
+  const resolvedProvider = firstConfiguredValue([provider, env.CAREER_OPS_HAWKEYE_PROVIDER], DEFAULT_PROVIDER);
+  const resolvedBaseUrl = firstConfiguredValue([baseUrl, env.CAREER_OPS_HAWKEYE_BASE_URL, hermes.baseUrl], DEFAULT_NVIDIA_BASE_URL);
+  const resolvedModel = firstConfiguredValue([model, env.CAREER_OPS_HAWKEYE_MODEL, hermes.model], DEFAULT_NVIDIA_MODEL);
+  const resolvedAllowPaid = parseBool(allowPaid ?? env.CAREER_OPS_HAWKEYE_ALLOW_PAID, false);
+  const resolvedTimeoutMs = parsePositiveInt(timeoutMs || env.CAREER_OPS_HAWKEYE_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+  const resolvedMaxRetries = parseRetryCount(maxRetries ?? env.CAREER_OPS_HAWKEYE_MAX_RETRIES, DEFAULT_MAX_RETRIES);
+  const key = env.NVIDIA_API_KEY || readEnvValue(hermesEnvPath, 'NVIDIA_API_KEY');
+  const host = hostFromUrl(resolvedBaseUrl);
+  const policy = {
+    provider: resolvedProvider,
+    baseUrl: resolvedBaseUrl,
+    baseUrlHostname: host,
+    model: resolvedModel,
+    allowPaid: resolvedAllowPaid,
+    timeoutMs: resolvedTimeoutMs,
+    maxRetries: Math.min(resolvedMaxRetries, DEFAULT_MAX_RETRIES),
+    evaluatorVersion: 'hawkeye-provider-policy-v1+nvidia-nim+career-ops-1-5',
+    key,
+    keySource: key ? (env.NVIDIA_API_KEY ? 'environment' : 'hermes-env-file') : 'missing',
+    root,
+  };
+  validateProviderPolicy(policy);
+  return policy;
+}
+
+function validateProviderPolicy(policy) {
+  if (policy.provider !== 'nvidia-nim') {
+    throw new Error(`Provider "${policy.provider || 'unavailable'}" is not approved for Hawkeye evaluation. Approved provider: nvidia-nim.`);
+  }
+  if (!policy.key) throw new Error('NVIDIA_API_KEY is required for nvidia-nim evaluation.');
+  if (!policy.baseUrl) throw new Error('NVIDIA NIM base URL is required.');
+  if (!policy.model) throw new Error('NVIDIA NIM model is required.');
+  if (policy.allowPaid) throw new Error('Paid fallback remains disabled for Hawkeye evaluation.');
+  if (policy.baseUrl === 'https://api.openai.com/v1' || policy.baseUrlHostname === 'api.openai.com') {
+    throw new Error('Paid OpenAI fallback is blocked for Hawkeye evaluation.');
+  }
+}
+
 function evaluationInputHash(root, jdPath, evaluatorTemplate) {
   const parts = [
     readFileSync(jdPath, 'utf-8'),
@@ -825,7 +953,39 @@ function splitCommandTemplate(template) {
   return args;
 }
 
-function resolveEvaluatorCommand(template, root, job, jdPath) {
+function commandIncludes(parts, value) {
+  return parts.some((part) => String(part).includes(value));
+}
+
+function argAfter(parts, flag) {
+  const idx = parts.indexOf(flag);
+  return idx === -1 ? '' : parts[idx + 1] || '';
+}
+
+function validateEvaluatorCommandPolicy(parts, policy, explicitEvaluator) {
+  const commandText = parts.join(' ');
+  const usesOpenAiEval = commandIncludes(parts, 'openai-eval.mjs');
+  if (!usesOpenAiEval) return;
+  const url = argAfter(parts, '--url') || process.env.OPENAI_BASE_URL || '';
+  const model = argAfter(parts, '--model') || process.env.OPENAI_MODEL || '';
+  if (!url) {
+    throw new Error('OpenAI-compatible Hawkeye evaluation requires an explicit approved --url; api.openai.com fallback is blocked.');
+  }
+  if (hostFromUrl(url) === 'api.openai.com' && !policy?.allowPaid) {
+    throw new Error('Paid OpenAI fallback is blocked for Hawkeye evaluation.');
+  }
+  if (explicitEvaluator && policy?.provider === 'nvidia-nim') {
+    if (url.replace(/\/$/, '') !== policy.baseUrl.replace(/\/$/, '')) {
+      throw new Error(`Evaluator URL host "${hostFromUrl(url) || 'unavailable'}" does not match approved provider host "${policy.baseUrlHostname}".`);
+    }
+    if (!model) throw new Error('NVIDIA NIM model is required.');
+  }
+  if (/api\.openai\.com/i.test(commandText) && !policy?.allowPaid) {
+    throw new Error('Paid OpenAI fallback is blocked for Hawkeye evaluation.');
+  }
+}
+
+function resolveEvaluatorCommand(template, root, job, jdPath, policy = null, explicitEvaluator = false) {
   const rendered = String(template)
     .replaceAll('{jd}', jdPath)
     .replaceAll('{job_id}', job.job_id);
@@ -848,6 +1008,7 @@ function resolveEvaluatorCommand(template, root, job, jdPath) {
   if (forbidden.some((token) => commandText.toLowerCase().includes(token.toLowerCase()))) {
     throw new Error(`Evaluator command is not allowed for Hawkeye evaluation bridge: ${tokenFromForbidden(commandText, forbidden)}`);
   }
+  validateEvaluatorCommandPolicy(parts, policy, explicitEvaluator);
   return { executable, args, commandText, cwd: root };
 }
 
@@ -879,10 +1040,18 @@ function recommendationFromCareerOps(score, hardMismatches, explicitRecommendati
 export function evaluateJob(jobId, {
   root = ROOT,
   dataDir = DEFAULT_DATA_DIR,
-  evaluator = process.env.CAREER_OPS_HAWKEYE_EVALUATOR || DEFAULT_EVALUATOR_TEMPLATE,
+  evaluator = null,
   actor = 'local-user',
   force = false,
-  timeoutMs = 300000,
+  timeoutMs = null,
+  maxRetries = null,
+  provider = null,
+  baseUrl = null,
+  model = null,
+  allowPaid = null,
+  env = process.env,
+  hermesEnvPath = env.CAREER_OPS_HAWKEYE_HERMES_ENV || '/root/.hermes/.env',
+  hermesConfigPath = env.CAREER_OPS_HAWKEYE_HERMES_CONFIG || '/root/.hermes/config.yaml',
 } = {}) {
   const state = loadState(root, dataDir);
   const job = state.jobs.find((item) => item.job_id === jobId);
@@ -892,27 +1061,56 @@ export function evaluateJob(jobId, {
     || (currentReference && !currentReference.startsWith('reports/') ? currentReference : join(dataDir, JDS_DIR, `${job.job_id}.md`));
   const jdPath = resolve(root, jdRel);
   if (!existsSync(jdPath)) throw new Error(`Hawkeye JD file is missing: ${jdRel}`);
-  const inputHash = evaluationInputHash(root, jdPath, evaluator);
+  const explicitEvaluator = Boolean(evaluator);
+  const policy = explicitEvaluator
+    ? null
+    : resolveProviderPolicy({ root, env, provider, baseUrl, model, allowPaid, timeoutMs, maxRetries, hermesEnvPath, hermesConfigPath });
+  const evaluatorTemplate = evaluator || env.CAREER_OPS_HAWKEYE_EVALUATOR || renderProviderEvaluator(policy);
+  const effectiveTimeoutMs = parsePositiveInt(timeoutMs || policy?.timeoutMs || env.CAREER_OPS_HAWKEYE_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+  const effectiveMaxRetries = policy?.maxRetries ?? 0;
+  const inputHash = evaluationInputHash(root, jdPath, [
+    evaluatorTemplate,
+    policy?.provider || 'custom',
+    policy?.baseUrl || '',
+    policy?.model || '',
+    policy?.allowPaid ? 'paid-allowed' : 'paid-disabled',
+  ].join('\n'));
   if (!force && job.evaluation?.status === 'career_ops_evaluated' && job.evaluation?.input_hash === inputHash) {
     return { ok: true, skipped: true, reason: 'unchanged evaluation inputs', job_id: job.job_id, evaluation: job.evaluation };
   }
-  const command = resolveEvaluatorCommand(evaluator, root, job, jdPath);
+  const command = resolveEvaluatorCommand(evaluatorTemplate, root, job, jdPath, policy, explicitEvaluator);
   const reportsBefore = reportSnapshot(root);
   let stdout = '';
-  try {
-    stdout = execFileSync(command.executable, command.args, {
-      cwd: command.cwd,
-      encoding: 'utf-8',
-      timeout: Number(timeoutMs) || 300000,
-      env: {
-        ...process.env,
-        HAWKEYE_JOB_ID: job.job_id,
-        HAWKEYE_JD_FILE: jdPath,
-      },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-  } catch (err) {
-    throw new Error(`Career Ops evaluation failed: ${err.stderr?.toString()?.trim() || err.message}`);
+  let attempts = 0;
+  const childEnv = {
+    ...env,
+    HAWKEYE_JOB_ID: job.job_id,
+    HAWKEYE_JD_FILE: jdPath,
+  };
+  if (policy) {
+    childEnv.OPENAI_API_KEY = policy.key;
+    childEnv.OPENAI_BASE_URL = policy.baseUrl;
+    childEnv.OPENAI_MODEL = policy.model;
+  }
+  for (;;) {
+    attempts++;
+    try {
+      stdout = execFileSync(command.executable, command.args, {
+        cwd: command.cwd,
+        encoding: 'utf-8',
+        timeout: effectiveTimeoutMs,
+        env: childEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      break;
+    } catch (err) {
+      const raw = err.stderr?.toString()?.trim() || err.message;
+      const safe = redactSecrets(raw, [policy?.key, env.OPENAI_API_KEY, env.NVIDIA_API_KEY]);
+      const retryable = policy && attempts <= effectiveMaxRetries && /(?:HTTP\s+5\d\d|temporar|ECONNRESET|ETIMEDOUT|network)/i.test(safe);
+      const stop = /(?:quota|insufficient_quota|rate.?limit|HTTP\s+4(?:01|03|29)|authentication|unauthorized|forbidden)/i.test(safe);
+      if (retryable && !stop) continue;
+      throw new Error(`Career Ops evaluation failed: ${safe}`);
+    }
   }
   const reportRelFromOutput = firstReportPathFromOutput(stdout);
   const reportCandidate = reportRelFromOutput
@@ -947,7 +1145,15 @@ export function evaluateJob(jobId, {
     jd_path: jdRel,
     evaluator_command: command.commandText,
     evaluation_command: command.commandText,
-    evaluator_version: 'career-ops-1-5',
+    evaluator_provider: policy?.provider || 'custom',
+    evaluator_model: policy?.model || null,
+    evaluator_base_url_hostname: policy?.baseUrlHostname || null,
+    evaluator_paid_allowed: Boolean(policy?.allowPaid),
+    evaluator_timeout_ms: effectiveTimeoutMs,
+    evaluator_max_retries: effectiveMaxRetries,
+    evaluator_attempts: attempts,
+    provider_status: 'success',
+    evaluator_version: policy?.evaluatorVersion || 'career-ops-1-5',
     version: 'career-ops-1-5',
     evaluated_at: nowIso(),
     input_hash: inputHash,
@@ -967,6 +1173,12 @@ export function evaluateJob(jobId, {
     evaluation_reference: job.evaluation.report_path || job.evaluation.reference,
     previous_evaluation_reference: previousReference,
     canonical_score: job.evaluation.canonical_score,
+    evaluator_provider: job.evaluation.evaluator_provider,
+    evaluator_model: job.evaluation.evaluator_model,
+    evaluator_base_url_hostname: job.evaluation.evaluator_base_url_hostname,
+    evaluator_version: job.evaluation.evaluator_version,
+    evaluator_timeout_ms: job.evaluation.evaluator_timeout_ms,
+    provider_status: job.evaluation.provider_status,
   });
   return { ok: true, skipped: false, job_id: job.job_id, evaluation: job.evaluation };
 }
@@ -1165,10 +1377,15 @@ export async function runCli(argv = process.argv.slice(2), root = process.cwd())
       const result = evaluateJob(first, {
         root,
         dataDir,
-        evaluator: args.evaluator || process.env.CAREER_OPS_HAWKEYE_EVALUATOR || DEFAULT_EVALUATOR_TEMPLATE,
+        evaluator: args.evaluator || null,
         actor: args.actor || 'local-user',
         force: Boolean(args.force),
-        timeoutMs: args.timeoutMs || 300000,
+        timeoutMs: args.timeoutMs || null,
+        maxRetries: args.maxRetries || null,
+        provider: args.provider || null,
+        baseUrl: args.baseUrl || null,
+        model: args.model || null,
+        allowPaid: args.allowPaid ?? null,
       });
       return { code: 0, stdout: JSON.stringify(result, null, 2), stderr: '' };
     }
