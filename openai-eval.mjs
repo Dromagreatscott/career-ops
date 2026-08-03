@@ -31,6 +31,7 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { outputLanguageInstruction, parseOutputLanguage } from './profile-language.mjs';
+import { parseEvaluationMetadata, safeReportSlug } from './evaluation-report-utils.mjs';
 import {
   formatReportNumber, releaseReportNumbers, reserveReportNumbers,
 } from './reserve-report-num.mjs';
@@ -247,7 +248,11 @@ IMPORTANT OPERATING RULES FOR THIS SESSION
    - Post-evaluation file saving is handled by the script, not by you.
 2. ${languageInstruction}
 3. Generate Blocks A through G in full.
-4. At the very end, output this exact machine-readable block:
+4. Do not invent or embellish career facts, metrics, client counts, revenue,
+   ROI, savings, adoption rates, retention rates, dates, credentials, project
+   names, employers, or outcomes. If the CV/profile sources do not verify a
+   claim, label it as a gap or question instead of using it as evidence.
+5. At the very end, output this exact machine-readable block:
 
 ---SCORE_SUMMARY---
 COMPANY: <company name or "Unknown">
@@ -349,24 +354,22 @@ console.log(evaluationText);
 // ---------------------------------------------------------------------------
 // Parse score summary
 // ---------------------------------------------------------------------------
-const summaryMatch = evaluationText.match(/---SCORE_SUMMARY---\s*([\s\S]*?)---END_SUMMARY---/);
-
-let company    = 'unknown';
-let role       = 'unknown';
+let company    = 'unavailable';
+let role       = 'unavailable';
 let score      = '?';
-let archetype  = 'unknown';
-let legitimacy = 'unknown';
+let archetype  = 'unavailable';
+let legitimacy = 'unavailable';
 
-if (summaryMatch) {
-  const extract = (key) => {
-    const m = summaryMatch[1].match(new RegExp(`${key}:\\s*(.+)`));
-    return m ? m[1].trim() : 'unknown';
-  };
-  company    = extract('COMPANY');
-  role       = extract('ROLE');
-  score      = extract('SCORE');
-  archetype  = extract('ARCHETYPE');
-  legitimacy = extract('LEGITIMACY');
+try {
+  const metadata = parseEvaluationMetadata(evaluationText);
+  company = metadata.company || 'unavailable';
+  role = metadata.role || 'unavailable';
+  score = metadata.scoreText || '?';
+  archetype = metadata.archetype || 'unavailable';
+  legitimacy = metadata.legitimacy || 'unavailable';
+} catch (err) {
+  console.error(`❌  Could not safely parse Career Ops evaluation metadata: ${err.message}`);
+  process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -382,7 +385,7 @@ if (saveReport) {
     reservedNumbers   = await reserveReportNumbers(1, { rootDir: ROOT, reportsDir: PATHS.reports });
     const num         = formatReportNumber(reservedNumbers[0]);
     const today       = new Date().toISOString().split('T')[0];
-    const companySlug = company.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const companySlug = safeReportSlug(company, role);
     const filename    = `${num}-${companySlug}-${today}.md`;
     const reportPath  = join(PATHS.reports, filename);
 

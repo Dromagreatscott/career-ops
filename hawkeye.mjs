@@ -26,6 +26,11 @@ import { fingerprintText, similarity } from './fingerprint-core.mjs';
 import { classifyTier } from './classify-tier.mjs';
 import { roleFuzzyMatch } from './role-matcher.mjs';
 import { extractJdSkills, classifySkillGaps } from './jd-skill-gap.mjs';
+import {
+  filterUsableEvidence,
+  parseEvaluationMetadata,
+  verifyReportClaims,
+} from './evaluation-report-utils.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_DATA_DIR = 'data/hawkeye';
@@ -589,22 +594,6 @@ function parseReportSummary(content, file, root = ROOT) {
   };
 }
 
-function scoreFromText(text) {
-  const summary = String(text || '').match(/---SCORE_SUMMARY---\s*([\s\S]*?)---END_SUMMARY---/);
-  const summaryScore = summary?.[1]?.match(/^\s*SCORE:\s*([0-9]+(?:\.[0-9]+)?)\s*$/im)?.[1];
-  const scoreText = summaryScore
-    || String(text || '').match(/\*\*Score:\*\*\s*([0-9]+(?:\.[0-9]+)?)\/5/i)?.[1]
-    || String(text || '').match(/^\s*score:\s*([0-9]+(?:\.[0-9]+)?)/im)?.[1];
-  const score = scoreText == null ? null : Number(scoreText);
-  return Number.isFinite(score) && score >= 0 && score <= 5 ? score : null;
-}
-
-function fieldFromScoreSummary(text, key) {
-  const summary = String(text || '').match(/---SCORE_SUMMARY---\s*([\s\S]*?)---END_SUMMARY---/);
-  const match = summary?.[1]?.match(new RegExp(`^\\s*${key}:\\s*(.+?)\\s*$`, 'im'));
-  return match ? match[1].trim() : '';
-}
-
 function firstReportPathFromOutput(output) {
   const match = String(output || '').match(/\breports\/[A-Za-z0-9._/-]+\.md\b/);
   return match ? match[0] : '';
@@ -665,47 +654,94 @@ function bulletsFromSection(text, headingPatterns) {
     .slice(0, 8);
 }
 
-function fallbackRationale(text) {
-  const block = sectionBody(text, [/match with cv/, /\bb\).*match/, /rationale/, /summary/]);
-  return block.split('\n').map((line) => line.trim()).filter(Boolean).slice(0, 8);
+function cleanEvidenceLine(line) {
+  return String(line || '')
+    .replace(/^\s*[-*]\s+/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
-function parseCareerOpsEvaluation(content, reportPath = '') {
-  const score = scoreFromText(content);
+function isEvidenceArtifact(line) {
+  return !line
+    || /^```/.test(line)
+    || /^yaml$/i.test(line)
+    || /^[-|:\s]+$/.test(line)
+    || /^[A-Za-z_][A-Za-z0-9_-]*:\s*/.test(line)
+    || /\b(?:machine summary|risk_summary|advertised_comp|posting_legitimacy|employment_classification|culture_screen|interview_red_flags)\b/i.test(line);
+}
+
+function tableEvidenceFromSection(body) {
+  const out = [];
+  let evidenceIndex = 1;
+  for (const raw of String(body || '').split('\n')) {
+    const line = raw.trim();
+    if (!line.startsWith('|') || /^\|?\s*-+/.test(line)) continue;
+    const cells = line.split('|').map((cell) => cell.trim()).filter(Boolean);
+    if (cells.length < 2) continue;
+    if (cells.some((cell) => /(?:cv evidence|supporting evidence|evidence)/i.test(cell))) {
+      const index = cells.findIndex((cell) => /(?:cv evidence|supporting evidence|evidence)/i.test(cell));
+      evidenceIndex = index === -1 ? evidenceIndex : index;
+      continue;
+    }
+    const evidenceCell = cells[evidenceIndex] || cells[1];
+    const cleaned = cleanEvidenceLine(evidenceCell);
+    if (!isEvidenceArtifact(cleaned)) out.push(cleaned);
+  }
+  return out;
+}
+
+function evidenceFromSection(text, headingPatterns) {
+  const body = sectionBody(text, headingPatterns);
+  const table = tableEvidenceFromSection(body);
+  const bullets = [...body.matchAll(/^\s*[-*]\s+(.+)$/gm)]
+    .map((match) => cleanEvidenceLine(match[1]))
+    .filter((line) => !isEvidenceArtifact(line));
+  const lines = [...table, ...bullets];
+  return [...new Set(lines)].slice(0, 8);
+}
+
+function fallbackRationale(text) {
+  const block = sectionBody(text, [/match with cv/, /\bb\).*match/, /rationale/]);
+  return block.split('\n')
+    .map(cleanEvidenceLine)
+    .filter((line) => !isEvidenceArtifact(line))
+    .slice(0, 8);
+}
+
+function parseCareerOpsEvaluation(content, reportPath = '', { root = ROOT } = {}) {
+  const metadata = parseEvaluationMetadata(content);
+  const score = metadata.score;
   if (score == null) throw new Error('Career Ops evaluation output has no canonical 1-5 score.');
-  const company = fieldFromScoreSummary(content, 'COMPANY')
-    || parseSimpleYamlScalars(sectionBody(content, [/machine summary/])).company
-    || String(content).match(/\*\*Company:\*\*\s*(.+)$/im)?.[1]?.trim()
-    || '';
-  const role = fieldFromScoreSummary(content, 'ROLE')
-    || parseSimpleYamlScalars(sectionBody(content, [/machine summary/])).role
-    || String(content).match(/\*\*Role:\*\*\s*(.+)$/im)?.[1]?.trim()
-    || '';
-  const archetype = fieldFromScoreSummary(content, 'ARCHETYPE')
-    || String(content).match(/\*\*Archetype:\*\*\s*(.+)$/im)?.[1]?.trim()
-    || '';
-  const legitimacy = fieldFromScoreSummary(content, 'LEGITIMACY')
-    || String(content).match(/\*\*Legitimacy:\*\*\s*(.+)$/im)?.[1]?.trim()
-    || '';
   const explicitRecommendation = String(content).match(/\*\*Recommendation:\*\*\s*(.+)$/im)?.[1]?.trim()
     || String(content).match(/^Recommendation:\s*(.+)$/im)?.[1]?.trim()
     || '';
-  const strongestEvidence = bulletsFromSection(content, [/strongest evidence/, /top strengths/, /\bstrengths\b/, /match with cv/]);
+  const verification = verifyReportClaims(content, { root });
+  if (verification.contradictory.length > 0) {
+    throw new Error(`Career Ops evaluation contains contradictory unsupported claims: ${verification.contradictory.map((item) => item.claim).join(' | ')}`);
+  }
+  const strongestEvidenceRaw = [
+    ...evidenceFromSection(content, [/match with cv/, /\bb\).*match/, /supporting evidence/, /evidence table/]),
+    ...evidenceFromSection(content, [/strongest evidence/, /top strengths/, /\bstrengths\b/]),
+  ];
+  const strongestEvidence = filterUsableEvidence(strongestEvidenceRaw, verification);
   const evidenceGaps = bulletsFromSection(content, [/evidence gaps/, /soft gaps/, /\bgaps\b/, /hard stops/]);
   const hardMismatches = bulletsFromSection(content, [/hard mismatches/, /hard stops/, /blockers/, /red flags/])
     .filter((line) => !/^none\.?$/i.test(line));
+  const rationale = filterUsableEvidence(fallbackRationale(content), verification);
   return {
-    company,
-    role,
+    company: metadata.company,
+    role: metadata.role,
     canonical_score: score,
     score_scale: '1-5',
-    archetype,
-    legitimacy,
+    archetype: metadata.archetype,
+    legitimacy: metadata.legitimacy,
     explicit_recommendation: explicitRecommendation,
-    strongest_evidence: strongestEvidence.length ? strongestEvidence : fallbackRationale(content),
+    strongest_evidence: strongestEvidence.length ? strongestEvidence : rationale,
     evidence_gaps: evidenceGaps,
     hard_mismatches: hardMismatches,
-    career_ops_rationale: fallbackRationale(content),
+    career_ops_rationale: rationale,
+    claim_verification: verification,
+    evaluation_status: verification.status,
     report_path: reportPath,
     report_sha256: sha256(content),
   };
@@ -1029,6 +1065,16 @@ function validateEvaluationIdentity(parsed, job) {
   }
 }
 
+function hasAttachedCareerOpsEvaluation(evaluation) {
+  return [
+    'career_ops_evaluated',
+    'evaluation_complete',
+    'evaluation_complete_with_warnings',
+    'evaluation_requires_review',
+    'evaluation_rejected_untrusted',
+  ].includes(evaluation?.status);
+}
+
 function recommendationFromCareerOps(score, hardMismatches, explicitRecommendation = '') {
   const explicit = explicitRecommendation.toLowerCase();
   if (hardMismatches.length) return 'reject';
@@ -1075,7 +1121,7 @@ export function evaluateJob(jobId, {
     policy?.model || '',
     policy?.allowPaid ? 'paid-allowed' : 'paid-disabled',
   ].join('\n'));
-  if (!force && job.evaluation?.status === 'career_ops_evaluated' && job.evaluation?.input_hash === inputHash) {
+  if (!force && hasAttachedCareerOpsEvaluation(job.evaluation) && job.evaluation?.input_hash === inputHash) {
     return { ok: true, skipped: true, reason: 'unchanged evaluation inputs', job_id: job.job_id, evaluation: job.evaluation };
   }
   const command = resolveEvaluatorCommand(evaluatorTemplate, root, job, jdPath, policy, explicitEvaluator);
@@ -1120,14 +1166,16 @@ export function evaluateJob(jobId, {
   const reportPath = reportCandidate?.full || '';
   const reportContent = reportPath && existsSync(reportPath) ? readFileSync(reportPath, 'utf-8') : stdout;
   if (!reportContent.trim()) throw new Error('Career Ops evaluation produced no parseable output.');
-  const parsed = parseCareerOpsEvaluation(reportContent, reportRel);
+  const parsed = parseCareerOpsEvaluation(reportContent, reportRel, { root });
   validateEvaluationIdentity(parsed, job);
   const profile = loadProfile(root);
+  const previousStatus = job.evaluation?.status || 'pending_career_ops_evaluation';
   const previousReference = job.evaluation?.report_path || (currentReference.startsWith('reports/') ? currentReference : '');
   const previousHash = job.evaluation?.input_hash || '';
   job.evaluation = {
-    status: 'career_ops_evaluated',
-    evaluation_status: 'career_ops_evaluated',
+    status: parsed.evaluation_status,
+    evaluation_status: parsed.evaluation_status,
+    score_trust: parsed.evaluation_status === 'evaluation_complete' ? 'trusted' : 'requires_review',
     canonical_score: parsed.canonical_score,
     score_scale: parsed.score_scale,
     tier: classifyTier(job.fields.title.value || ''),
@@ -1139,7 +1187,9 @@ export function evaluateJob(jobId, {
     strongest_evidence: parsed.strongest_evidence,
     evidence_gaps: parsed.evidence_gaps,
     hard_mismatches: parsed.hard_mismatches.length ? parsed.hard_mismatches : hardMismatches(job),
-    recommendation: recommendationFromCareerOps(parsed.canonical_score, parsed.hard_mismatches, parsed.explicit_recommendation),
+    recommendation: parsed.evaluation_status === 'evaluation_requires_review'
+      ? 'watch'
+      : recommendationFromCareerOps(parsed.canonical_score, parsed.hard_mismatches, parsed.explicit_recommendation),
     report_path: parsed.report_path || null,
     reference: jdRel,
     jd_path: jdRel,
@@ -1159,20 +1209,22 @@ export function evaluateJob(jobId, {
     input_hash: inputHash,
     report_sha256: parsed.report_sha256,
     career_ops_rationale: parsed.career_ops_rationale,
+    claim_verification: parsed.claim_verification,
     previous_evaluation_reference: previousReference || null,
   };
   saveState(root, dataDir, state);
   appendAudit(root, dataDir, {
     event: 'evaluation',
     job_id: job.job_id,
-    prior_state: previousHash ? 'career_ops_evaluated' : 'pending_career_ops_evaluation',
-    new_state: 'career_ops_evaluated',
+    prior_state: previousStatus,
+    new_state: job.evaluation.evaluation_status,
     actor,
     reason: previousHash && previousHash !== inputHash ? 'reevaluation after changed inputs' : 'career-ops evaluation attached',
     source_file: relative(root, job.source_file),
     evaluation_reference: job.evaluation.report_path || job.evaluation.reference,
     previous_evaluation_reference: previousReference,
     canonical_score: job.evaluation.canonical_score,
+    score_trust: job.evaluation.score_trust,
     evaluator_provider: job.evaluation.evaluator_provider,
     evaluator_model: job.evaluation.evaluator_model,
     evaluator_base_url_hostname: job.evaluation.evaluator_base_url_hostname,
@@ -1210,6 +1262,8 @@ function recommendationFor(score, mismatches = []) {
 function groupFor(job) {
   const score = job.evaluation?.canonical_score;
   if (job.evaluation?.hard_mismatches?.length) return 'reject';
+  if (job.evaluation?.evaluation_status === 'evaluation_rejected_untrusted') return 'reject';
+  if (job.evaluation?.evaluation_status === 'evaluation_requires_review') return 'watch';
   if (score == null) return 'watch';
   if (score >= 4.5) return 'strong';
   if (score >= 4.0) return 'good';
@@ -1249,7 +1303,7 @@ export function ingest({ root = ROOT, inboxDir = DEFAULT_INBOX_DIR, dataDir = DE
       });
     } else if (existing) {
       existing.deduplication = dedup;
-      if (existing.evaluation?.status !== 'career_ops_evaluated' || existing.source_sha256 !== candidate.source_sha256) {
+      if (!hasAttachedCareerOpsEvaluation(existing.evaluation) || existing.source_sha256 !== candidate.source_sha256) {
         existing.evaluation = buildEvaluation(root, dataDir, existing);
       }
       stored = existing;

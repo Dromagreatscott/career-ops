@@ -26,6 +26,11 @@ import {
   runCli,
   shortlist,
 } from './hawkeye.mjs';
+import {
+  parseEvaluationMetadata,
+  safeReportSlug,
+  verifyReportClaims,
+} from './evaluation-report-utils.mjs';
 
 let passed = 0;
 let failed = 0;
@@ -65,7 +70,9 @@ function setupRoot() {
 AI, Automation, Workflow, API, Integration, Dashboard, Strategy, Executive Leadership, Workday
 
 ## Experience
-Built production AI automation workflows, operational dashboards, and API integrations for business teams.
+Built production AI automation workflows, operational dashboards, API integrations, and business outcomes for business teams.
+Listing Launch: 20-node workflow catalog and 100+ validated tests.
+No sponsorship needed.
 `, 'utf-8');
   writeFileSync(join(root, 'config-profile.tmp'), '', 'utf-8');
   return root;
@@ -123,7 +130,68 @@ function writeFakeEvaluator(root, mode = 'success', score = 4.6) {
   } else if (mode === 'missing-score') {
     report = '# Evaluation: SyntheticCo — Director of AI\\n\\n## Strongest Evidence\\n- Career Ops rationale without a score\\n';
   } else if (mode === 'conflict') {
-    report = '# Evaluation: WrongCo — Director of AI\\n\\n**Company:** WrongCo\\n**Role:** Director of AI\\n**Score:** 4.2/5\\n\\n---SCORE_SUMMARY---\\nCOMPANY: WrongCo\\nROLE: Director of AI\\nSCORE: 4.2\\nARCHETYPE: AI Transformation\\nLEGITIMACY: High Confidence\\n---END_SUMMARY---\\n';
+    report = `# Evaluation: WrongCo — Director of AI
+
+**Company:** WrongCo
+**Role:** Director of AI
+**Score:** 4.2/5
+
+---SCORE_SUMMARY---
+COMPANY: WrongCo
+ROLE: Director of AI
+SCORE: 4.2
+ARCHETYPE: AI Transformation
+LEGITIMACY: High Confidence
+---END_SUMMARY---
+`;
+  } else if (mode === 'no-summary') {
+    report = `# Evaluation: unknown — unknown
+
+**Date:** 2026-08-02
+**Archetype:** unknown
+**Score:** ?/5
+**Legitimacy:** unknown
+
+---
+
+# Evaluation: SyntheticCo — Director of AI
+
+**Score:** ${score}/5
+**Archetype:** AI Transformation
+**Legitimacy:** Proceed with Caution
+
+## B) Match with CV
+| JD Requirement | CV Evidence | Gap & Mitigation |
+|----------------|-------------|------------------|
+| Lead applied AI automation programs | Built production AI automation workflows, operational dashboards, and API integrations for business teams. | None |
+| Build workflow automation | Listing Launch: 20-node workflow catalog and 100+ validated tests. | None |
+`;
+  } else if (mode === 'unsupported') {
+    report = `# Evaluation: SyntheticCo — Director of AI
+
+**Score:** ${score}/5
+**Archetype:** AI Transformation
+**Legitimacy:** Proceed with Caution
+
+## B) Match with CV
+| JD Requirement | CV Evidence | Gap & Mitigation |
+|----------------|-------------|------------------|
+| Build dashboards | Built production AI automation workflows, operational dashboards, and API integrations for business teams. | Add unsupported 40% savings. |
+
+## Cover Letter Draft
+- Delivered $1.2M+ ROI for 15+ clients across 10+ industries.
+- Designed Attorney Timekeeper with 95% client adoption and 98% retention.
+`;
+  } else if (mode === 'contradictory') {
+    report = `# Evaluation: SyntheticCo — Director of AI
+
+**Score:** ${score}/5
+**Archetype:** AI Transformation
+**Legitimacy:** High Confidence
+
+## Strongest Evidence
+- Sponsorship required for this candidate.
+`;
   } else {
     report = `# Evaluation: SyntheticCo — Director of AI
 
@@ -334,6 +402,86 @@ ${longDescription}
 `;
 
 console.log('\n--- Hawkeye local scouting MVP ---');
+
+{
+  const report = `# Evaluation: unknown — unknown
+
+**Score:** ?/5
+
+# Evaluation: SyntheticCo — Director of AI
+
+**Score:** 4.2/5
+**Archetype:** AI Transformation
+**Legitimacy:** Proceed with Caution
+`;
+  const metadata = parseEvaluationMetadata(report);
+  eq('fallback company parsing from evaluation heading', metadata.company, 'SyntheticCo');
+  eq('fallback role parsing from evaluation heading', metadata.role, 'Director of AI');
+  eq('fallback score parsing from report body', metadata.score, 4.2);
+  eq('fallback archetype parsing from report body', metadata.archetype, 'AI Transformation');
+  eq('fallback legitimacy parsing from report body', metadata.legitimacy, 'Proceed with Caution');
+  eq('safe report filename slug uses parsed metadata', safeReportSlug(metadata.company, metadata.role), 'syntheticco-director-of-ai');
+}
+
+{
+  const metadata = parseEvaluationMetadata('# Evaluation: Unknown — Unknown\n\nNo machine metadata.');
+  eq('missing metadata remains unavailable to caller', metadata.company, '');
+  eq('missing score remains null', metadata.score, null);
+}
+
+{
+  let threw = false;
+  try {
+    parseEvaluationMetadata('**Score:** 4.2/5\n\n---SCORE_SUMMARY---\nSCORE: 3.1\n---END_SUMMARY---');
+  } catch (err) {
+    threw = err.message.includes('Ambiguous');
+  }
+  ok('ambiguous metadata rejected', threw);
+}
+
+{
+  const root = setupRoot();
+  try {
+    const verification = verifyReportClaims('Listing Launch: 20-node workflow catalog and 100+ validated tests.', { root });
+    eq('verified numeric claim accepted', verification.status, 'evaluation_complete');
+    ok('verified claim recorded', verification.verified.length > 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const verification = verifyReportClaims('Produced business outcomes through production AI automation workflows and operational dashboards.', { root });
+    eq('supported paraphrase accepted', verification.status, 'evaluation_complete');
+    ok('supported paraphrase recorded', verification.supported_but_paraphrased.length > 0 || verification.verified.length > 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const verification = verifyReportClaims('Delivered $1.2M+ ROI for 15+ clients across 10+ industries.', { root });
+    eq('unsupported numeric claim requires review', verification.status, 'evaluation_requires_review');
+    ok('unsupported numeric claim recorded', verification.unsupported.length > 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const verification = verifyReportClaims('Sponsorship required for this candidate.', { root });
+    eq('contradictory claim rejected', verification.status, 'evaluation_rejected_untrusted');
+    ok('contradictory claim recorded', verification.contradictory.length > 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
 
 {
   const root = setupRoot();
@@ -590,13 +738,65 @@ ${'Own executive AI implementation, dashboards, and transformation. '.repeat(20)
     const fake = writeFakeEvaluator(root, 'success', 4.6);
     const result = evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
     const job = getJob(id, { root });
-    eq('successful evaluation handoff marks Career Ops evaluated', result.evaluation.status, 'career_ops_evaluated');
+    eq('successful evaluation handoff marks evaluation complete', result.evaluation.status, 'evaluation_complete');
     eq('canonical 1-5 score preserved after evaluation', job.evaluation.canonical_score, 4.6);
     eq('score scale remains 1-5', job.evaluation.score_scale, '1-5');
     eq('evidence preservation from Career Ops report', job.evaluation.strongest_evidence[0], 'Production AI automation programs');
     eq('evidence gap preservation from Career Ops report', job.evaluation.evidence_gaps[0], 'Enterprise governance metrics');
     eq('shortlist recomputes strong after canonical score', shortlist({ root }).strong[0].job_id, id);
     ok('evaluation report path attached', job.evaluation.report_path.endsWith('reports/099-syntheticco-2026-08-02.md'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'no-summary', 4.2);
+    evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    const job = getJob(id, { root });
+    eq('fallback parser attaches company from nested evaluation heading', job.evaluation.archetype, 'AI Transformation');
+    eq('fallback parser attaches legitimacy from nested report body', job.evaluation.legitimacy, 'Proceed with Caution');
+    eq('fallback parser preserves canonical score', job.evaluation.canonical_score, 4.2);
+    ok('YAML wrapper excluded from strongest evidence', !job.evaluation.strongest_evidence.some((line) => line.includes('```') || line.includes('advertised_comp')));
+    eq('evidence-section preference uses CV evidence table', job.evaluation.strongest_evidence[0], 'Built production AI automation workflows, operational dashboards, and API integrations for business teams.');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'unsupported', 4.2);
+    evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    const job = getJob(id, { root });
+    eq('unsupported material claims require review state', job.evaluation.evaluation_status, 'evaluation_requires_review');
+    eq('score trust downgraded when evidence is untrusted', job.evaluation.score_trust, 'requires_review');
+    eq('canonical 1-5 score still preserved during review', job.evaluation.canonical_score, 4.2);
+    ok('unsupported claims are recorded but not promoted as evidence', job.evaluation.claim_verification.unsupported.length > 0);
+    ok('unsupported numeric claim excluded from strongest evidence', !job.evaluation.strongest_evidence.join('\n').includes('$1.2M'));
+    eq('requires-review evaluation stays in watch shortlist group', shortlist({ root }).watch[0].job_id, id);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = setupRoot();
+  try {
+    const id = ingestSynthetic(root);
+    const fake = writeFakeEvaluator(root, 'contradictory', 4.2);
+    let threw = false;
+    try {
+      evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
+    } catch (err) {
+      threw = err.message.includes('contradictory unsupported claims');
+    }
+    ok('contradictory career claim fails evaluation', threw);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -957,7 +1157,7 @@ ${'Own executive AI implementation, dashboards, and transformation. '.repeat(20)
     evaluateJob(id, { root, evaluator: `${process.execPath} ${fake} --file {jd}` });
     ingest({ root });
     eq('repeated ingestion preserves attached Career Ops score', getJob(id, { root }).evaluation.canonical_score, 4.6);
-    eq('repeated ingestion preserves evaluated status', getJob(id, { root }).evaluation.status, 'career_ops_evaluated');
+    eq('repeated ingestion preserves evaluated status', getJob(id, { root }).evaluation.status, 'evaluation_complete');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
