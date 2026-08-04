@@ -247,7 +247,7 @@ IMPORTANT OPERATING RULES FOR THIS SESSION
    - Block G (Legitimacy): analyze JD text only; skip URL/page freshness checks.
    - Post-evaluation file saving is handled by the script, not by you.
 2. ${languageInstruction}
-3. Generate Blocks A through G in full.
+3. Generate Blocks A through G in full. Do not generate cover letters, cover-letter drafts, outreach copy, recruiter messages, application answers, or other application materials unless the user explicitly requests application-material generation.
 4. Do not invent or embellish career facts, metrics, client counts, revenue,
    ROI, savings, adoption rates, retention rates, dates, credentials, project
    names, employers, or outcomes. If the CV/profile sources do not verify a

@@ -4,8 +4,9 @@
  *
  * Hawkeye imports approved local job descriptions, normalizes and deduplicates
  * them, links existing Career Ops 1-5 evaluations when available, and records
- * local human decisions. It never searches the web, opens portals, sends email,
- * generates application packages, or submits applications.
+ * local human decisions. Its scout command may use Career Ops' public ATS
+ * scanner; it never sends email, generates application packages, or submits
+ * applications.
  */
 
 import { createHash } from 'crypto';
@@ -29,6 +30,7 @@ import { extractJdSkills, classifySkillGaps } from './jd-skill-gap.mjs';
 import {
   filterUsableEvidence,
   parseEvaluationMetadata,
+  sanitizeEvaluationReport,
   verifyReportClaims,
 } from './evaluation-report-utils.mjs';
 
@@ -56,21 +58,23 @@ const FORBIDDEN_COMMANDS = new Set([
   'gmail',
   'portal',
   'package',
+  'application-package',
   'generate',
 ]);
 
 function usage() {
   return `Usage:
   node hawkeye.mjs ingest [--inbox <dir>] [--data-dir <dir>] [--actor <name>]
+  node hawkeye.mjs scout [--limit <n>] [--location <text>] [--remote] [--min-score <n>] [--sources <greenhouse,lever,ashby,workday>] [--dry-run] [--no-evaluate]
   node hawkeye.mjs evaluate <job-id> [--evaluator <command-template>] [--provider nvidia-nim] [--model <id>] [--base-url <url>] [--force] [--data-dir <dir>]
   node hawkeye.mjs shortlist [--data-dir <dir>]
   node hawkeye.mjs show <job-id> [--data-dir <dir>]
   node hawkeye.mjs decide <job-id> <approve|reject|watch|research> [--reason <text>] [--actor <name>] [--data-dir <dir>]
 
 Safety:
-  Hawkeye MVP is local-only. It does not search live jobs, open browsers,
-  generate packages, send email, create Gmail drafts, contact recruiters,
-  upload resumes, or submit applications.`;
+  Hawkeye scout only uses accessible public scanner-supported ATS sources.
+  It does not generate packages, send email, create Gmail drafts, contact
+  recruiters, upload resumes, bypass access controls, or submit applications.`;
 }
 
 function sha256(text) {
@@ -327,6 +331,7 @@ function normalizeFromJson(rawText, sourcePath) {
   const parsed = JSON.parse(rawText);
   const description = normalizeWhitespace(parsed.description || parsed.job_description || parsed.body || '');
   return makeNormalizedJob({
+    externalId: parsed.external_id || parsed.externalId,
     company: parsed.company,
     title: parsed.title || parsed.role_title || parsed.role,
     location: parsed.location,
@@ -340,6 +345,7 @@ function normalizeFromJson(rawText, sourcePath) {
     closingDate: parsed.closing_date || parsed.closingDate,
     requiredQualifications: arrayValue(parsed.required_qualifications || parsed.requiredQualifications),
     preferredQualifications: arrayValue(parsed.preferred_qualifications || parsed.preferredQualifications),
+    liveness: parsed.liveness,
     sourcePath,
   });
 }
@@ -382,6 +388,8 @@ function makeNormalizedJob(input) {
     fingerprint,
     source_file: input.sourcePath,
     source_sha256: existsSync(input.sourcePath) ? sha256(readFileSync(input.sourcePath, 'utf-8')) : '',
+    external_id: input.externalId || null,
+    liveness: input.liveness || null,
   };
 }
 
@@ -1075,6 +1083,19 @@ function hasAttachedCareerOpsEvaluation(evaluation) {
   ].includes(evaluation?.status);
 }
 
+export function isSyntheticJob(job) {
+  const values = [
+    job?.job_id,
+    job?.fields?.source?.value,
+    job?.fields?.source_url?.value,
+    job?.source_file,
+    job?.fields?.company?.value,
+  ].map((value) => String(value || '').toLowerCase());
+  if (values.some((value) => value.includes('synthetic') || value.includes('fixture'))) return true;
+  if (values.some((value) => /\b(?:example\.test|\.test\/|localhost|127\.0\.0\.1)\b/.test(value))) return true;
+  return false;
+}
+
 function recommendationFromCareerOps(score, hardMismatches, explicitRecommendation = '') {
   const explicit = explicitRecommendation.toLowerCase();
   if (hardMismatches.length) return 'reject';
@@ -1164,9 +1185,30 @@ export function evaluateJob(jobId, {
     : changedReports(root, reportsBefore)[0];
   const reportRel = reportCandidate?.rel || '';
   const reportPath = reportCandidate?.full || '';
-  const reportContent = reportPath && existsSync(reportPath) ? readFileSync(reportPath, 'utf-8') : stdout;
+  const rawReportContent = reportPath && existsSync(reportPath) ? readFileSync(reportPath, 'utf-8') : stdout;
+  const sanitized = sanitizeEvaluationReport(rawReportContent, { root });
+  if (reportPath && existsSync(reportPath) && sanitized.content !== rawReportContent) {
+    writeFileSync(reportPath, sanitized.content, 'utf-8');
+  }
+  const reportContent = sanitized.content;
   if (!reportContent.trim()) throw new Error('Career Ops evaluation produced no parseable output.');
   const parsed = parseCareerOpsEvaluation(reportContent, reportRel, { root });
+  if (sanitized.policyWarnings.length) {
+    parsed.claim_verification.policy_warnings = sanitized.policyWarnings;
+    parsed.claim_verification.removed_application_sections = sanitized.removedApplicationSections;
+    parsed.claim_verification.removed_unsupported_claims = sanitized.removedUnsupportedClaims;
+    parsed.claim_verification.unsupported = [
+      ...(parsed.claim_verification.unsupported || []),
+      ...sanitized.removedUnsupportedClaims.map((item) => ({
+        claim: item.claim,
+        reason: `stripped outside verification section (${item.section})`,
+      })),
+    ];
+    if (sanitized.removedUnsupportedClaims.length && parsed.evaluation_status !== 'evaluation_rejected_untrusted') {
+      parsed.evaluation_status = 'evaluation_requires_review';
+      parsed.claim_verification.status = 'evaluation_requires_review';
+    }
+  }
   validateEvaluationIdentity(parsed, job);
   const profile = loadProfile(root);
   const previousStatus = job.evaluation?.status || 'pending_career_ops_evaluation';
@@ -1323,10 +1365,13 @@ export function ingest({ root = ROOT, inboxDir = DEFAULT_INBOX_DIR, dataDir = DE
   return { ok: true, files_read: files.length, jobs_total: state.jobs.length, results };
 }
 
-export function shortlist({ root = ROOT, dataDir = DEFAULT_DATA_DIR } = {}) {
+export function shortlist({ root = ROOT, dataDir = DEFAULT_DATA_DIR, includeSynthetic = true } = {}) {
   const state = loadState(root, dataDir);
   const groups = { strong: [], good: [], watch: [], reject: [] };
-  for (const job of state.jobs) groups[groupFor(job)].push(summaryRow(job));
+  for (const job of state.jobs) {
+    if (!includeSynthetic && isSyntheticJob(job)) continue;
+    groups[groupFor(job)].push(summaryRow(job));
+  }
   for (const group of Object.values(groups)) {
     group.sort((a, b) => (b.score_value ?? -1) - (a.score_value ?? -1) || a.company.localeCompare(b.company) || a.title.localeCompare(b.title));
   }
@@ -1426,6 +1471,27 @@ export async function runCli(argv = process.argv.slice(2), root = process.cwd())
       const result = ingest({ root, dataDir, inboxDir: args.inbox || DEFAULT_INBOX_DIR, actor: args.actor || 'local-user' });
       return { code: 0, stdout: JSON.stringify(result, null, 2), stderr: '' };
     }
+    if (cmd === 'scout') {
+      const { runHawkeyeScout, renderScoutSummary } = await import('./hawkeye-scout.mjs');
+      const sources = args.sources
+        ? String(args.sources).split(',').map((item) => item.trim()).filter(Boolean)
+        : undefined;
+      const result = await runHawkeyeScout({
+        root,
+        dataDir,
+        inboxDir: args.inbox || DEFAULT_INBOX_DIR,
+        actor: args.actor || 'hawkeye-scout',
+        limit: args.limit ? Number(args.limit) : undefined,
+        location: args.location || undefined,
+        remote: args.remote !== undefined ? Boolean(args.remote) : true,
+        minScore: args.minScore ? Number(args.minScore) : undefined,
+        sources,
+        dryRun: Boolean(args.dryRun),
+        noEvaluate: Boolean(args.noEvaluate),
+        hawkeye: { ingest, evaluateJob, getJob },
+      });
+      return { code: 0, stdout: renderScoutSummary(result), stderr: '' };
+    }
     if (cmd === 'evaluate') {
       if (!first) throw new Error('evaluate requires <job-id>.');
       const result = evaluateJob(first, {
@@ -1444,7 +1510,7 @@ export async function runCli(argv = process.argv.slice(2), root = process.cwd())
       return { code: 0, stdout: JSON.stringify(result, null, 2), stderr: '' };
     }
     if (cmd === 'shortlist') {
-      return { code: 0, stdout: renderShortlist(shortlist({ root, dataDir })), stderr: '' };
+      return { code: 0, stdout: renderShortlist(shortlist({ root, dataDir, includeSynthetic: Boolean(args.includeSynthetic) })), stderr: '' };
     }
     if (cmd === 'show') {
       if (!first) throw new Error('show requires <job-id>.');

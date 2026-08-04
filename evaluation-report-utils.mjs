@@ -126,13 +126,13 @@ export function normalizeClaimText(claim) {
   return stripMarkup(claim).toLowerCase().replace(/[,\s]+/g, ' ').replace(/[.);:]+$/g, '').trim();
 }
 
-function extractMetricTokens(text) {
+export function extractMetricTokens(text) {
   const clean = stripMarkup(text);
   const patterns = [
     /\b\d+(?:\.\d+)?\s?%/g,
     /\b[$€£]\s?\d[\d,.]*(?:\s?[kKmMbB])?/g,
     /\b\d+(?:\.\d+)?\s?x\b/gi,
-    /\b\d[\d,.]*\+?(?:\s|-)(?:(?:[A-Za-z-]+)\s+){0,2}(?:users|customers|clients|employees|engineers|teams|companies|industries|hours|days|weeks|months|years|minutes|seconds|requests|tokens|documents|workflows|pipelines|agents|interviews|applications|offers|reports|cvs|resumes|tests|nodes?|fixes|roi)\b/gi,
+    /\b\d[\d,.]*\+?(?:\s|-)(?:(?:[A-Za-z-]+)\s+){0,2}(?:users|customers|clients|employees|engineers|teams|companies|industries|hours|days|weeks|months|years|minutes|seconds|requests|tokens|documents|workflows|pipelines|agents|interviews|applications|offers|reports|cvs|resumes|tests|nodes?|fixes|roi|leaders|executives|workshops|deployments|members|direct reports|people)\b/gi,
   ];
   const claims = [];
   for (const pattern of patterns) {
@@ -141,9 +141,61 @@ function extractMetricTokens(text) {
   return claims;
 }
 
+const APPLICATION_MATERIAL_HEADING_RE = /\b(?:cover letter(?: draft)?|outreach draft|recruiter message|application answers|application draft|networking message|follow[-\s]?up message)\b/i;
+const APPLICATION_MATERIAL_CONTENT_RE = /\b(?:dear hiring manager|dear recruiter|i am excited to apply|i'm excited to apply|i am writing to apply|please find attached|thank you for considering my application|would welcome the opportunity to discuss|linkedin outreach|recruiter outreach)\b/i;
+const VERIFICATION_SECTION_RE = /\b(?:claim verification|source verification|fact verification|verification section|verification notes|candidate-claim verification)\b/i;
+
+function headingLabel(raw) {
+  const line = String(raw || '').trim();
+  const markdown = line.match(/^#{1,6}\s+(.+)$/);
+  if (markdown) return markdown[1].replace(/\s+#*$/, '').trim();
+  const plain = line.match(/^(?:\*\*)?([A-Z][A-Za-z /&-]{2,})(?:\*\*)?:\s*$/);
+  return plain ? plain[1].trim() : '';
+}
+
+function isApplicationMaterialHeading(raw) {
+  const label = headingLabel(raw);
+  return Boolean(label && APPLICATION_MATERIAL_HEADING_RE.test(label));
+}
+
+function isSectionBoundary(raw) {
+  return Boolean(headingLabel(raw));
+}
+
+export function stripApplicationMaterialSections(reportText) {
+  const lines = String(reportText || '').replace(/\r\n/g, '\n').split('\n');
+  const kept = [];
+  const removedSections = [];
+  const removedContentLines = [];
+  let stripping = false;
+
+  for (const raw of lines) {
+    if (isApplicationMaterialHeading(raw)) {
+      stripping = true;
+      removedSections.push(headingLabel(raw));
+      continue;
+    }
+    if (stripping && isSectionBoundary(raw)) {
+      stripping = false;
+    }
+    if (stripping) continue;
+    if (APPLICATION_MATERIAL_CONTENT_RE.test(raw)) {
+      removedContentLines.push(raw.trim());
+      continue;
+    }
+    kept.push(raw);
+  }
+
+  return {
+    content: kept.join('\n').replace(/\n{3,}/g, '\n\n').trim() + (kept.length ? '\n' : ''),
+    removedSections,
+    removedContentLines,
+  };
+}
+
 function materialLines(text) {
   const lines = [];
-  const material = /\b(?:clients?|customers?|industries|roi|revenue|savings?|costs?|adoption|retention|reduction|increase|decrease|outcomes?|metrics?|emergency fixes|attorney timekeeper|enterprise clients?|time savings|sponsorship required|requires sponsorship|needs sponsorship)\b/i;
+  const material = /\b(?:clients?|customers?|industries|roi|revenue|savings?|costs?|adoption|retention|reduction|increase|decrease|outcomes?|metrics?|emergency fixes|attorney timekeeper|enterprise clients?|time savings|production[-\s]?scale|deployed|deployments?|executive workshops?|business outcomes?|team size|direct reports?|sponsorship required|requires sponsorship|needs sponsorship)\b/i;
   let currentSection = '';
   for (const raw of String(text || '').split('\n')) {
     const heading = raw.match(/^#{1,6}\s+(.+)$/)?.[1]?.toLowerCase();
@@ -151,7 +203,7 @@ function materialLines(text) {
       currentSection = heading;
       continue;
     }
-    if (/\b(?:machine summary|comp and demand|posting legitimacy|risk summary|evidence gaps|gaps flagged)\b/i.test(currentSection)) continue;
+    if (/\b(?:machine summary|comp and demand|posting legitimacy|risk summary|evidence gaps|gaps flagged|claim verification|source verification|fact verification)\b/i.test(currentSection)) continue;
     const line = raw.replace(/^\s*[-*]\s+/, '').replace(/^\s*\|?/, '').trim();
     if (!line || /^```/.test(line) || /^[-|:\s]+$/.test(line)) continue;
     if (/^[A-Za-z_][A-Za-z0-9_-]*:\s*/.test(line)) continue;
@@ -238,6 +290,96 @@ export function verifyReportClaims(reportText, {
     contradictory,
     unverifiable,
     canonical_sources: sources,
+  };
+}
+
+function lineMatchesBlockedClaim(line, blockedClaims) {
+  const normalizedLine = normalizeClaimText(line).replace(/\s*\|\s*/g, ' ');
+  return blockedClaims.some((claim) => {
+    const normalizedClaim = normalizeClaimText(claim).replace(/\s*\|\s*/g, ' ');
+    return normalizedClaim && (normalizedLine.includes(normalizedClaim) || normalizedClaim.includes(normalizedLine));
+  });
+}
+
+function isVerificationSectionName(name) {
+  return VERIFICATION_SECTION_RE.test(String(name || ''));
+}
+
+export function detectUnsupportedClaimsOutsideVerification(reportText, options = {}) {
+  const verification = verifyReportClaims(reportText, options);
+  const blockedClaims = [
+    ...verification.unsupported,
+    ...verification.unverifiable,
+  ].map((item) => item.claim);
+  if (blockedClaims.length === 0) return [];
+
+  const findings = [];
+  let currentSection = '';
+  for (const raw of String(reportText || '').split('\n')) {
+    const label = headingLabel(raw);
+    if (label) {
+      currentSection = label;
+      continue;
+    }
+    if (isVerificationSectionName(currentSection)) continue;
+    if (lineMatchesBlockedClaim(raw, blockedClaims)) {
+      const match = blockedClaims.find((claim) => lineMatchesBlockedClaim(raw, [claim]));
+      findings.push({ claim: match, line: raw.trim(), section: currentSection || 'general' });
+    }
+  }
+  return findings;
+}
+
+function stripUnsupportedClaimLines(reportText, findings) {
+  if (!findings.length) return String(reportText || '');
+  const blockedClaims = findings.map((item) => item.claim);
+  const lines = String(reportText || '').split('\n');
+  const kept = [];
+  let currentSection = '';
+  for (const raw of lines) {
+    const label = headingLabel(raw);
+    if (label) currentSection = label;
+    if (!label && !isVerificationSectionName(currentSection) && lineMatchesBlockedClaim(raw, blockedClaims)) continue;
+    kept.push(raw);
+  }
+  return kept.join('\n').replace(/\n{3,}/g, '\n\n');
+}
+
+function appendPolicyVerificationSection(reportText, policyWarnings) {
+  if (!policyWarnings.length) return reportText;
+  const lines = [
+    reportText.trimEnd(),
+    '',
+    '## Claim Verification',
+    '',
+    'Policy warnings:',
+    ...policyWarnings.map((warning) => `- ${warning}`),
+    '',
+  ];
+  return lines.join('\n');
+}
+
+export function sanitizeEvaluationReport(reportText, options = {}) {
+  const application = stripApplicationMaterialSections(reportText);
+  const unsupportedFindings = detectUnsupportedClaimsOutsideVerification(application.content, options);
+  let content = stripUnsupportedClaimLines(application.content, unsupportedFindings);
+  const policyWarnings = [];
+  for (let i = 0; i < application.removedSections.length; i++) {
+    policyWarnings.push('removed unauthorized application-material section');
+  }
+  for (let i = 0; i < application.removedContentLines.length; i++) {
+    policyWarnings.push('removed unauthorized application-material content');
+  }
+  for (const finding of unsupportedFindings) {
+    policyWarnings.push(`stripped unsupported candidate claim outside verification (${finding.section}): ${finding.claim}`);
+  }
+  content = appendPolicyVerificationSection(content, policyWarnings);
+  return {
+    content,
+    policyWarnings,
+    removedApplicationSections: application.removedSections,
+    removedApplicationContentLines: application.removedContentLines,
+    removedUnsupportedClaims: unsupportedFindings,
   };
 }
 

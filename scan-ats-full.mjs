@@ -443,7 +443,7 @@ async function filterLive(offers) {
       const { result, reason } = await checkUrlLiveness(page, offer.url);
       const icon = result === 'active' ? '✅' : result === 'expired' ? '❌' : '⚠️';
       console.error(`  ${icon} ${result.padEnd(9)} ${offer.company} | ${offer.title}${result === 'expired' ? ` (${reason})` : ''}`);
-      if (result !== 'expired') live.push(offer); // keep 'uncertain' — transient errors retry next scan
+      if (result !== 'expired') live.push({ ...offer, liveness: { status: result, reason, checked_at: new Date().toISOString() } }); // keep 'uncertain' — transient errors retry next scan
     }
   } finally {
     await browser.close();
@@ -666,10 +666,15 @@ async function main() {
       unreachableBoards: totalErrors,
       saved,
       offers: offers.map(o => ({
+        id: o.id || o.externalId || o.external_id || null,
         company: o.company,
         title: o.title,
         url: o.url,
         location: o.location || null,
+        description: o.description || null,
+        salary: o.salary || o.compensation || null,
+        employmentType: o.employmentType || o.employment_type || null,
+        liveness: o.liveness || null,
         postedAt: o.postedAt ? new Date(o.postedAt).toISOString().slice(0, 10) : null,
         dateStatus: o.dateStatus || (o.postedAt ? 'dated' : 'unknown'),
         blacklisted: Boolean(o.blacklisted),
