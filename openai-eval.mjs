@@ -31,11 +31,11 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { outputLanguageInstruction, parseOutputLanguage } from './profile-language.mjs';
-import { parseEvaluationMetadata, safeReportSlug } from './evaluation-report-utils.mjs';
 import {
   formatReportNumber, releaseReportNumbers, reserveReportNumbers,
 } from './reserve-report-num.mjs';
 import { TokenAccumulator, formatBreakdown, normalizeOpenAIUsage } from './utils/token-tracker.mjs';
+import { buildBudgetedPrompt } from './lib/context-budget.mjs';
 
 const tracker = new TokenAccumulator();
 tracker.recordZeroToken('scan');
@@ -54,9 +54,9 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 const PATHS = {
   shared:  join(ROOT, 'modes', '_shared.md'),
   oferta:  join(ROOT, 'modes', 'oferta.md'),
-  cv:      join(ROOT, 'cv.md'),
+  cv:        join(ROOT, 'cv.md'),
   profileYml: join(ROOT, 'config', 'profile.yml'),
-  reports: join(ROOT, 'reports'),
+  reports:    join(ROOT, 'reports'),
 };
 
 // ---------------------------------------------------------------------------
@@ -84,6 +84,7 @@ if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
                      (env OPENAI_BASE_URL, default https://api.openai.com/v1)
     --key <key>      API key             (env OPENAI_API_KEY)
     --no-save        Do not save report to reports/ directory
+    --no-compress    Skip token budget compression (full context injection)
     --help           Show this help
 
   ENV
@@ -110,6 +111,7 @@ let modelName  = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 let baseUrl    = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
 let apiKey     = process.env.OPENAI_API_KEY || '';
 let saveReport = true;
+let noCompress = false;
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--file' && args[i + 1]) {
@@ -133,6 +135,8 @@ for (let i = 0; i < args.length; i++) {
     apiKey = args[++i];
   } else if (args[i] === '--no-save') {
     saveReport = false;
+  } else if (args[i] === '--no-compress') {
+    noCompress = true;
   } else if (!args[i].startsWith('--')) {
     jdText += (jdText ? '\n' : '') + args[i];
   }
@@ -210,34 +214,44 @@ function readFile(path, label) {
 // ---------------------------------------------------------------------------
 console.log('\n📂  Loading context files...');
 
-const sharedContext = readFile(PATHS.shared, 'modes/_shared.md');
-const ofertaLogic   = readFile(PATHS.oferta, 'modes/oferta.md');
-const cvContent     = readFile(PATHS.cv,     'cv.md');
+const sharedContext = readFile(PATHS.shared,     'modes/_shared.md');
+const ofertaLogic   = readFile(PATHS.oferta,     'modes/oferta.md');
+const cvContent     = readFile(PATHS.cv,         'cv.md');
 const profileYml    = readFile(PATHS.profileYml, 'config/profile.yml');
 const languageInstruction = outputLanguageInstruction(parseOutputLanguage(profileYml));
 
 // ---------------------------------------------------------------------------
-// Build system prompt
+// Build system prompt with token budget management
 // ---------------------------------------------------------------------------
+const { contextBody, budgetReport } = buildBudgetedPrompt({
+  sharedContent: sharedContext,
+  ofertaContent: ofertaLogic,
+  cvContent,
+  profileYml,
+  jdText,
+  noCompress,
+  maxTokens: 128_000, // gpt-4o-mini context window
+});
+
+// Log token budget info
+if (budgetReport.compressed) {
+  console.log(`📊  Token budget: ${budgetReport.beforeTokens} → ${budgetReport.afterTokens} tokens (saved ${budgetReport.beforeTokens - budgetReport.afterTokens})`);
+  console.log(`    Trimmed sections: ${budgetReport.removed.join(', ')}`);
+  if (budgetReport.overBudget) {
+    console.log(`    ⚠️  Still ${budgetReport.afterTokens - budgetReport.budget} tokens over budget after compression`);
+  }
+} else if (budgetReport.overBudget) {
+  console.log(`⚠️  Token budget: ${budgetReport.totalTokens} tokens exceeds ${budgetReport.budget} limit by ${budgetReport.totalTokens - budgetReport.budget}`);
+} else {
+  console.log(`📊  Token budget: ${budgetReport.totalTokens} tokens (within ${budgetReport.budget} limit)`);
+}
+
 const systemPrompt = `You are career-ops, an AI-powered job search assistant.
 You evaluate job offers against the user's CV using a structured A-G scoring system.
 
 Your evaluation methodology is defined below. Follow it exactly.
 
-═══════════════════════════════════════════════════════
-SYSTEM CONTEXT (_shared.md)
-═══════════════════════════════════════════════════════
-${sharedContext}
-
-═══════════════════════════════════════════════════════
-EVALUATION MODE (oferta.md)
-═══════════════════════════════════════════════════════
-${ofertaLogic}
-
-═══════════════════════════════════════════════════════
-CANDIDATE RESUME (cv.md)
-═══════════════════════════════════════════════════════
-${cvContent}
+${contextBody}
 
 ═══════════════════════════════════════════════════════
 IMPORTANT OPERATING RULES FOR THIS SESSION
@@ -247,12 +261,8 @@ IMPORTANT OPERATING RULES FOR THIS SESSION
    - Block G (Legitimacy): analyze JD text only; skip URL/page freshness checks.
    - Post-evaluation file saving is handled by the script, not by you.
 2. ${languageInstruction}
-3. Generate Blocks A through G in full. Do not generate cover letters, cover-letter drafts, outreach copy, recruiter messages, application answers, or other application materials unless the user explicitly requests application-material generation.
-4. Do not invent or embellish career facts, metrics, client counts, revenue,
-   ROI, savings, adoption rates, retention rates, dates, credentials, project
-   names, employers, or outcomes. If the CV/profile sources do not verify a
-   claim, label it as a gap or question instead of using it as evidence.
-5. At the very end, output this exact machine-readable block:
+3. Generate Blocks A through G in full.
+4. At the very end, output this exact machine-readable block:
 
 ---SCORE_SUMMARY---
 COMPANY: <company name or "Unknown">
@@ -354,22 +364,24 @@ console.log(evaluationText);
 // ---------------------------------------------------------------------------
 // Parse score summary
 // ---------------------------------------------------------------------------
-let company    = 'unavailable';
-let role       = 'unavailable';
-let score      = '?';
-let archetype  = 'unavailable';
-let legitimacy = 'unavailable';
+const summaryMatch = evaluationText.match(/---SCORE_SUMMARY---\s*([\s\S]*?)---END_SUMMARY---/);
 
-try {
-  const metadata = parseEvaluationMetadata(evaluationText);
-  company = metadata.company || 'unavailable';
-  role = metadata.role || 'unavailable';
-  score = metadata.scoreText || '?';
-  archetype = metadata.archetype || 'unavailable';
-  legitimacy = metadata.legitimacy || 'unavailable';
-} catch (err) {
-  console.error(`❌  Could not safely parse Career Ops evaluation metadata: ${err.message}`);
-  process.exit(1);
+let company    = 'unknown';
+let role       = 'unknown';
+let score      = '?';
+let archetype  = 'unknown';
+let legitimacy = 'unknown';
+
+if (summaryMatch) {
+  const extract = (key) => {
+    const m = summaryMatch[1].match(new RegExp(`${key}:\\s*(.+)`));
+    return m ? m[1].trim() : 'unknown';
+  };
+  company    = extract('COMPANY');
+  role       = extract('ROLE');
+  score      = extract('SCORE');
+  archetype  = extract('ARCHETYPE');
+  legitimacy = extract('LEGITIMACY');
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +397,7 @@ if (saveReport) {
     reservedNumbers   = await reserveReportNumbers(1, { rootDir: ROOT, reportsDir: PATHS.reports });
     const num         = formatReportNumber(reservedNumbers[0]);
     const today       = new Date().toISOString().split('T')[0];
-    const companySlug = safeReportSlug(company, role);
+    const companySlug = company.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     const filename    = `${num}-${companySlug}-${today}.md`;
     const reportPath  = join(PATHS.reports, filename);
 
