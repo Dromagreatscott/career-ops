@@ -4,7 +4,7 @@ import yaml from "js-yaml";
 import { careerOpsRoot, readApplications } from "@/lib/career-ops";
 import { companyPrioritiesFromProfile, companyPriorityFor } from "./company-priority";
 import { canonicalApplyUrl, plainSummary, scoreValue, sourcePlatform, stableId, stageFromEvaluation, stageFromStatus, workArrangementFromText } from "./normalize";
-import type { Application, AuditEvent, CommandCenterData, EducationItem, EmploymentHistoryItem, Evaluation, Job, Outreach, ProfileView } from "./types";
+import type { Application, ApplicationPackage, Approval, AuditEvent, CommandCenterData, EducationItem, EmploymentHistoryItem, Evaluation, Job, Outreach, ProfileView } from "./types";
 
 function readText(rel: string): string | null {
   try {
@@ -266,8 +266,9 @@ function trackerApplications(jobs: Job[]): Application[] {
     const match = byCompanyTitle.get(`${row.company.toLowerCase()}|${row.role.toLowerCase()}`);
     const score = scoreValue(row.score);
     const reportMatch = row.report.match(/\(([^)]+)\)/);
-    return {
+    const app: Application = {
       id: row.n ? `tracker-${row.n}` : stableId("tracker", `${row.company}-${row.role}-${row.date}`),
+      jobId: match?.id,
       trackerNumber: row.n || undefined,
       company: row.company,
       title: row.role,
@@ -281,6 +282,80 @@ function trackerApplications(jobs: Job[]): Application[] {
       notes: row.notes,
       updatedDate: row.date,
     };
+    app.applicationPackage = applicationPackageForApplication(app, row.pdf);
+    return app;
+  });
+}
+
+function hasPreparedMaterial(pdfCell: string | undefined): boolean {
+  const text = String(pdfCell ?? "").trim();
+  return Boolean(text && !/^(?:-|—|❌|no|n\/a)$/i.test(text));
+}
+
+function packageStatusFor(app: Pick<Application, "stage" | "status">, pdfCell?: string): ApplicationPackage["status"] {
+  if (/approv/i.test(app.status) || app.stage === "Approved") return "approved";
+  if (app.stage === "Ready for Review" || hasPreparedMaterial(pdfCell)) return "ready_for_review";
+  if (app.stage === "Preparing") return "preparing";
+  return "not_started";
+}
+
+function applicationPackageForApplication(app: Application, pdfCell?: string): ApplicationPackage {
+  const status = packageStatusFor(app, pdfCell);
+  return {
+    jobId: app.jobId || app.id,
+    trackerNumber: app.trackerNumber,
+    company: app.company,
+    title: app.title,
+    status,
+    approvalRequired: "prepare_application",
+    submitApprovalRequired: "submit_application",
+    materialSummary: materialSummary(status),
+    canonicalApplyUrl: app.canonicalApplyUrl,
+    reportHref: app.reportHref,
+  };
+}
+
+function applicationPackageForJob(job: Job): ApplicationPackage {
+  const status: ApplicationPackage["status"] = job.trackerNumber ? packageStatusFor({ stage: job.stage, status: job.status ?? job.stage }) : "not_connected";
+  return {
+    jobId: job.id,
+    trackerNumber: job.trackerNumber,
+    company: job.company,
+    title: job.title,
+    status,
+    approvalRequired: "prepare_application",
+    submitApprovalRequired: "submit_application",
+    materialSummary: materialSummary(status),
+    canonicalApplyUrl: job.canonicalApplyUrl,
+    reportHref: job.reportHref,
+  };
+}
+
+function materialSummary(status: ApplicationPackage["status"]): string {
+  if (status === "approved") return "Application materials approved; external submission still requires explicit approval.";
+  if (status === "ready_for_review") return "Application materials are ready for human review.";
+  if (status === "preparing") return "Application materials are being prepared.";
+  if (status === "not_connected") return "No tracker-backed package exists yet.";
+  return "No application package has been prepared yet.";
+}
+
+function applicationPackages(jobs: Job[], applications: Application[]): ApplicationPackage[] {
+  const packages = new Map<string, ApplicationPackage>();
+  for (const app of applications) {
+    if (app.applicationPackage) packages.set(app.applicationPackage.jobId, app.applicationPackage);
+  }
+  for (const job of jobs) {
+    if (!packages.has(job.id)) packages.set(job.id, applicationPackageForJob(job));
+  }
+  return [...packages.values()].sort((a, b) => {
+    const order: Record<ApplicationPackage["status"], number> = {
+      ready_for_review: 0,
+      preparing: 1,
+      approved: 2,
+      not_started: 3,
+      not_connected: 4,
+    };
+    return order[a.status] - order[b.status] || a.company.localeCompare(b.company);
   });
 }
 
@@ -410,14 +485,47 @@ function auditEvents(): AuditEvent[] {
   });
 }
 
+function approvalsFromPackagesAndOutreach(packages: ApplicationPackage[], outreach: Outreach[]): Approval[] {
+  const approvals: Approval[] = [];
+  for (const pkg of packages) {
+    if (pkg.status === "not_started" || pkg.status === "preparing") {
+      approvals.push({ type: "prepare_application", status: "required", targetId: pkg.jobId });
+    }
+    if (pkg.status === "ready_for_review") {
+      approvals.push({ type: "submit_application", status: "required", targetId: pkg.jobId });
+    }
+    if (pkg.status === "approved") {
+      approvals.push({ type: "submit_application", status: "approved", targetId: pkg.jobId });
+    }
+  }
+  for (const item of outreach) {
+    approvals.push({
+      type: item.approvalRequired,
+      status: item.status === "draft_ready" ? "required" : item.status === "approved" || item.status === "sent" ? "approved" : "not_requested",
+      targetId: item.id,
+    });
+  }
+  if (!approvals.some((approval) => approval.type === "send_recruiter_message")) {
+    approvals.push({ type: "send_recruiter_message", status: "not_requested" });
+  }
+  if (!approvals.some((approval) => approval.type === "send_hiring_manager_message")) {
+    approvals.push({ type: "send_hiring_manager_message", status: "not_requested" });
+  }
+  return approvals;
+}
+
 export function commandCenterData(): CommandCenterData {
   const profile = readProfileYaml();
   const jobs = mergeJobs();
+  const applications = trackerApplications(jobs);
+  const packages = applicationPackages(jobs, applications);
+  const outreach = outreachFromJobs(jobs);
   return {
     jobs,
-    applications: trackerApplications(jobs),
-    outreach: outreachFromJobs(jobs),
-    approvals: [],
+    applications,
+    applicationPackages: packages,
+    outreach,
+    approvals: approvalsFromPackagesAndOutreach(packages, outreach),
     auditEvents: auditEvents(),
     profile: profileView(profile),
   };

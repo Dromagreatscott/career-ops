@@ -4,11 +4,12 @@ import { ApplicationPipeline } from "@/components/command-center/application-pip
 export const dynamic = "force-dynamic";
 
 export default function ApplicationsPage() {
-  const { applications, jobs } = commandCenterData();
+  const { applications, jobs, applicationPackages, approvals } = commandCenterData();
   const discovered = jobs
     .filter((job) => !job.trackerNumber)
     .map((job) => ({
       id: `job-${job.id}`,
+      jobId: job.id,
       company: job.company,
       title: job.title,
       stage: job.stage,
@@ -17,6 +18,7 @@ export default function ApplicationsPage() {
       scoreLabel: job.fitScore == null ? "TBD" : `${job.fitScore}/5`,
       canonicalApplyUrl: job.canonicalApplyUrl,
       sourceUrl: job.sourceUrl,
+      applicationPackage: applicationPackages.find((pkg) => pkg.jobId === job.id),
     }));
-  return <ApplicationPipeline applications={[...applications, ...discovered]} />;
+  return <ApplicationPipeline applications={[...applications, ...discovered]} applicationPackages={applicationPackages} approvals={approvals} />;
 }

@@ -68,6 +68,7 @@ export type Job = {
 
 export type Application = {
   id: string;
+  jobId?: string;
   trackerNumber?: string;
   company: string;
   title: string;
@@ -80,12 +81,20 @@ export type Application = {
   reportHref?: string;
   notes?: string;
   updatedDate?: string;
+  applicationPackage?: ApplicationPackage;
 };
 
 export type ApplicationPackage = {
   jobId: string;
+  trackerNumber?: string;
+  company: string;
+  title: string;
   status: "not_started" | "preparing" | "ready_for_review" | "approved" | "not_connected";
   approvalRequired: ApprovalType;
+  submitApprovalRequired: ApprovalType;
+  materialSummary: string;
+  canonicalApplyUrl?: string;
+  reportHref?: string;
 };
 
 export type Outreach = {
@@ -151,6 +160,7 @@ export type ProfileView = {
 export type CommandCenterData = {
   jobs: Job[];
   applications: Application[];
+  applicationPackages: ApplicationPackage[];
   outreach: Outreach[];
   approvals: Approval[];
   auditEvents: AuditEvent[];

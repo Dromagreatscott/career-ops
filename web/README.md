@@ -29,7 +29,8 @@ Open http://localhost:3000. The app reads the career-ops checkout it lives in
   when known, and aggregator links are labeled as needing ATS resolution.
 - **Applications** — tracker-backed stages for Discovered, Evaluating,
   Qualified, Preparing, Ready for Review, Approved, Submitted, Interview,
-  Rejected, Closed and Withdrawn.
+  Rejected, Closed and Withdrawn, plus an approval-gated review queue derived
+  from existing tracker/package signals.
 - **Outreach** — approval-gated planning surface for recruiters, hiring
   managers, DMs and follow-ups. In this phase it shows honest "not connected"
   states and does not send anything.
