@@ -34,8 +34,9 @@ Open http://localhost:3000. The app reads the career-ops checkout it lives in
   managers, DMs and follow-ups. In this phase it shows honest "not connected"
   states and does not send anything.
 - **Profile** — canonical career profile view, with edits routed through Config:
-  contact details, target roles, compensation/geography, standard answers,
-  resume variants, dream companies and excluded role types.
+  contact details, CV-backed employment history and education, portfolio links,
+  target roles, compensation/geography, standard answers, resume variants,
+  dream companies and excluded role types.
 - **Pipeline** — your tracker as a sortable, filterable table; status changes
   write back through the core's own scripts.
 - **Explore** — the free reverse-ATS scan with an honest partial-dataset

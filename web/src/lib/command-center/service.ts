@@ -4,7 +4,7 @@ import yaml from "js-yaml";
 import { careerOpsRoot, readApplications } from "@/lib/career-ops";
 import { companyPrioritiesFromProfile, companyPriorityFor } from "./company-priority";
 import { canonicalApplyUrl, plainSummary, scoreValue, sourcePlatform, stableId, stageFromEvaluation, stageFromStatus, workArrangementFromText } from "./normalize";
-import type { Application, AuditEvent, CommandCenterData, Evaluation, Job, Outreach, ProfileView } from "./types";
+import type { Application, AuditEvent, CommandCenterData, EducationItem, EmploymentHistoryItem, Evaluation, Job, Outreach, ProfileView } from "./types";
 
 function readText(rel: string): string | null {
   try {
@@ -39,6 +39,76 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function asStringList(value: unknown): string[] {
   return Array.isArray(value) ? value.map(String).map((s) => s.trim()).filter(Boolean) : [];
+}
+
+function sectionFromMarkdown(md: string | null, heading: string): string {
+  if (!md) return "";
+  const lines = md.split("\n");
+  const start = lines.findIndex((line) => line.trim().toLowerCase() === `## ${heading}`.toLowerCase());
+  if (start === -1) return "";
+  const body: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) break;
+    body.push(lines[i]);
+  }
+  return body.join("\n").trim();
+}
+
+function parseEmploymentHistory(cv: string | null): EmploymentHistoryItem[] {
+  const section = sectionFromMarkdown(cv, "Professional Experience");
+  if (!section) return [];
+
+  const chunks = section.split(/^###\s+/m).map((chunk) => chunk.trim()).filter(Boolean);
+  return chunks.map((chunk) => {
+    const lines = chunk.split("\n").map((line) => line.trim()).filter(Boolean);
+    const organizationLine = lines.shift() ?? "";
+    const [organization, ...locationParts] = organizationLine.split(",").map((part) => part.trim()).filter(Boolean);
+    let title: string | undefined;
+    let dates: string | undefined;
+    const highlights: string[] = [];
+
+    for (const line of lines) {
+      const titleMatch = line.match(/^\*\*(.+?)\*\*$/);
+      if (titleMatch && !title) {
+        title = titleMatch[1].trim();
+        continue;
+      }
+      if (!dates && !line.startsWith("-") && /\b(?:present|\d{4})\b/i.test(line)) {
+        dates = line;
+        continue;
+      }
+      if (line.startsWith("-")) highlights.push(line.replace(/^-\s*/, "").trim());
+    }
+
+    return {
+      organization: organization || organizationLine,
+      location: locationParts.join(", ") || undefined,
+      title,
+      dates,
+      highlights: highlights.slice(0, 2),
+    };
+  });
+}
+
+function parseEducation(cv: string | null): EducationItem[] {
+  const section = sectionFromMarkdown(cv, "Education & Professional Development");
+  if (!section) return [];
+
+  return section.split("\n").flatMap((line) => {
+    const clean = line.trim().replace(/^-\s*/, "");
+    if (!clean) return [];
+    const boldMatch = clean.match(/^\*\*(.+?),\*\*\s*(.+)$/);
+    if (boldMatch) return [{ label: boldMatch[1].trim(), details: boldMatch[2].trim() }];
+    return [{ label: clean.replace(/\*\*/g, "") }];
+  });
+}
+
+function parsePortfolio(profile: Record<string, unknown> | null, cv: string | null): string[] {
+  const candidate = asRecord(profile?.candidate);
+  const configured = [candidate.portfolio_url, candidate.linkedin, candidate.github].map((value) => String(value ?? "").trim()).filter(Boolean);
+  const portfolioSection = sectionFromMarkdown(cv, "Industries & Portfolio");
+  const urls = portfolioSection.match(/https?:\/\/[^\s)]+|(?:[\w-]+\.)+[a-z]{2,}(?:\/[^\s)]*)?/gi) ?? [];
+  return [...new Set([...configured, ...urls.map((url) => url.replace(/[.,;]+$/, ""))])];
 }
 
 type PipelineEntry = {
@@ -261,6 +331,7 @@ function profileView(profile: Record<string, unknown> | null): ProfileView {
   const targetRoles = asRecord(profile?.target_roles);
   const compensation = asRecord(profile?.compensation);
   const location = asRecord(profile?.location);
+  const cv = readText("cv.md");
   const standardAnswers = {
     work_authorization: String(location.visa_status ?? ""),
     onsite_availability: String(location.onsite_availability ?? ""),
@@ -276,6 +347,9 @@ function profileView(profile: Record<string, unknown> | null): ProfileView {
       portfolioUrl: String(candidate.portfolio_url ?? ""),
       github: String(candidate.github ?? ""),
     },
+    employmentHistory: parseEmploymentHistory(cv),
+    education: parseEducation(cv),
+    portfolio: parsePortfolio(profile, cv),
     preferredRoles: [...asStringList(targetRoles.primary), ...asStringList(targetRoles.secondary)],
     salaryTarget: String(compensation.target_range ?? ""),
     geographicPreferences: String(compensation.location_flexibility ?? location.onsite_availability ?? ""),

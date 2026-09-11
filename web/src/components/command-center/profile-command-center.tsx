@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { BriefcaseBusiness, MapPin, Pencil, ShieldCheck, Sparkles, UserRound } from "lucide-react";
+import { BriefcaseBusiness, GraduationCap, LinkIcon, MapPin, Pencil, ShieldCheck, Sparkles, UserRound } from "lucide-react";
 import type { ProfileView } from "@/lib/command-center/types";
 
 export function ProfileCommandCenter({ profile }: { profile: ProfileView }) {
@@ -39,6 +39,59 @@ export function ProfileCommandCenter({ profile }: { profile: ProfileView }) {
             {profile.preferredRoles.map((role) => (
               <span key={role} className="rounded-md bg-surface-hover px-2 py-1 text-xs text-muted">{role}</span>
             ))}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-border bg-surface/45 p-5 lg:col-span-2">
+          <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.16em] text-muted">
+            <BriefcaseBusiness className="size-4 text-brand" /> Employment history
+          </h2>
+          <div className="mt-3 grid gap-3 md:grid-cols-3">
+            {profile.employmentHistory.length ? profile.employmentHistory.map((item) => (
+              <article key={`${item.organization}-${item.title ?? ""}`} className="rounded-md border border-border bg-background/40 p-3">
+                <div className="text-sm font-medium text-foreground">{item.organization}</div>
+                <div className="mt-1 text-xs text-muted">{[item.title, item.dates].filter(Boolean).join(" - ")}</div>
+                {item.location ? <div className="mt-1 text-xs text-faint">{item.location}</div> : null}
+                {item.highlights.length ? (
+                  <ul className="mt-3 space-y-1 text-xs leading-relaxed text-muted">
+                    {item.highlights.map((highlight) => <li key={highlight}>{highlight}</li>)}
+                  </ul>
+                ) : null}
+              </article>
+            )) : (
+              <div className="rounded-md border border-dashed border-border px-3 py-5 text-sm text-muted">Employment history is not connected yet.</div>
+            )}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-border bg-surface/45 p-5">
+          <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.16em] text-muted">
+            <GraduationCap className="size-4 text-brand" /> Education
+          </h2>
+          <div className="mt-3 space-y-2">
+            {profile.education.length ? profile.education.map((item) => (
+              <div key={`${item.label}-${item.details ?? ""}`} className="rounded-md bg-background/45 px-3 py-2 text-sm">
+                <div className="text-foreground">{item.label}</div>
+                {item.details ? <div className="mt-0.5 text-xs text-muted">{item.details}</div> : null}
+              </div>
+            )) : (
+              <div className="rounded-md border border-dashed border-border px-3 py-5 text-sm text-muted">Education is not connected yet.</div>
+            )}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-border bg-surface/45 p-5">
+          <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.16em] text-muted">
+            <LinkIcon className="size-4 text-brand" /> Portfolio
+          </h2>
+          <div className="mt-3 space-y-2">
+            {profile.portfolio.length ? profile.portfolio.map((item) => (
+              <a key={item} href={item.startsWith("http") ? item : `https://${item}`} target="_blank" rel="noreferrer" className="block truncate rounded-md bg-background/45 px-3 py-2 text-sm text-brand-text hover:underline">
+                {item}
+              </a>
+            )) : (
+              <div className="rounded-md border border-dashed border-border px-3 py-5 text-sm text-muted">Portfolio links are not connected yet.</div>
+            )}
           </div>
         </section>
 

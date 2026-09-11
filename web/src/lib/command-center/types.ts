@@ -113,6 +113,19 @@ export type AuditEvent = {
   summary: string;
 };
 
+export type EmploymentHistoryItem = {
+  organization: string;
+  location?: string;
+  title?: string;
+  dates?: string;
+  highlights: string[];
+};
+
+export type EducationItem = {
+  label: string;
+  details?: string;
+};
+
 export type ProfileView = {
   contact: {
     fullName?: string;
@@ -123,6 +136,9 @@ export type ProfileView = {
     portfolioUrl?: string;
     github?: string;
   };
+  employmentHistory: EmploymentHistoryItem[];
+  education: EducationItem[];
+  portfolio: string[];
   preferredRoles: string[];
   salaryTarget?: string;
   geographicPreferences?: string;
