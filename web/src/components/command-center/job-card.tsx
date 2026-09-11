@@ -1,10 +1,10 @@
 import Link from "next/link";
-import { Bookmark, ExternalLink, FileCheck2, FileText, Sparkles, X } from "lucide-react";
+import { Sparkles } from "lucide-react";
 import { CompanyLogo } from "@/components/company-logo";
 import { Badge } from "@/components/ui/badge";
 import { scoreTone } from "@/lib/format";
-import { cn } from "@/lib/cn";
 import type { Job } from "@/lib/command-center/types";
+import { JobCardActions } from "./job-card-actions";
 
 export function CompanyPriorityBadge({ job, compact = false }: { job: Job; compact?: boolean }) {
   if (!job.dreamCompany) return null;
@@ -54,39 +54,12 @@ export function JobCard({ job }: { job: Job }) {
         )}
       </div>
 
-      <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
-        <button className="inline-flex items-center justify-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm text-muted transition hover:bg-surface-hover hover:text-foreground">
-          <X className="size-4" /> Skip
-        </button>
-        <button className="inline-flex items-center justify-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm text-muted transition hover:bg-surface-hover hover:text-foreground">
-          <Bookmark className="size-4" /> Save
-        </button>
-        <Link
-          href={`/apply?url=${encodeURIComponent(applyHref)}`}
-          className="inline-flex items-center justify-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand"
-        >
-          <FileCheck2 className="size-4" /> Prepare
-        </Link>
-        <Link
-          href={`/jobs/${job.id}`}
-          className="inline-flex items-center justify-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand"
-        >
-          <FileText className="size-4" /> Details
-        </Link>
-        <a
-          href={applyHref}
-          target="_blank"
-          rel="noreferrer"
-          className={cn(
-            "inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition",
-            job.canonicalApplyStatus === "resolved"
-              ? "bg-brand text-brand-foreground hover:bg-brand-200"
-              : "border border-amber-500/40 bg-amber-500/10 text-amber-800 hover:bg-amber-500/15 dark:text-amber-300",
-          )}
-        >
-          <ExternalLink className="size-4" /> Open ATS
-        </a>
-      </div>
+      <JobCardActions
+        jobId={job.id}
+        trackerNumber={job.trackerNumber}
+        applyHref={applyHref}
+        canonicalApplyResolved={job.canonicalApplyStatus === "resolved"}
+      />
     </article>
   );
 }
