@@ -82,7 +82,7 @@ export function TriageRow({
 
       {/* EVALUADA state (right-aligned, visually distinct from raw rows) */}
       {evaluated ? (
-        <Link href={`/jobs/${scored!.jobId}`} className="flex shrink-0 items-center gap-1.5 text-xs">
+        <Link href={`/workers/${scored!.jobId}`} className="flex shrink-0 items-center gap-1.5 text-xs">
           {scored!.running ? (
             <>
               <Loader2 className="size-3.5 animate-spin text-brand" />

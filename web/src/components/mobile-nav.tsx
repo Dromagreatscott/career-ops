@@ -124,6 +124,26 @@ export function MobileNav() {
         </div>
       </header>
 
+      <nav className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-4 border-t border-border bg-surface/95 px-2 pb-[calc(env(safe-area-inset-bottom)+0.35rem)] pt-1.5 shadow-2xl shadow-black/15 backdrop-blur md:hidden">
+        {NAV_ITEMS.filter((item) => ["/jobs", "/applications", "/outreach", "/profile"].includes(item.href)).map(({ href, label, icon: Icon }) => {
+          const active = isActivePath(href, pathname);
+          return (
+            <Link
+              key={href}
+              href={href}
+              aria-current={active ? "page" : undefined}
+              className={cn(
+                "flex min-h-[48px] flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[11px] font-medium transition-colors",
+                active ? "bg-brand-soft text-brand-text" : "text-muted hover:bg-surface-hover hover:text-foreground",
+              )}
+            >
+              <Icon className="size-5" />
+              <span className="truncate">{label}</span>
+            </Link>
+          );
+        })}
+      </nav>
+
       <div className={cn("co-mscrim md:hidden", open && "open")} onClick={() => setOpen(false)} aria-hidden />
 
       <aside

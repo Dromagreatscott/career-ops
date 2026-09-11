@@ -24,6 +24,18 @@ Open http://localhost:3000. The app reads the career-ops checkout it lives in
 
 ## What works today
 
+- **Jobs** — mobile-first command-center cards over the existing Career Ops and
+  Hawkeye data. Dream companies are marked, direct official ATS links are used
+  when known, and aggregator links are labeled as needing ATS resolution.
+- **Applications** — tracker-backed stages for Discovered, Evaluating,
+  Qualified, Preparing, Ready for Review, Approved, Submitted, Interview,
+  Rejected, Closed and Withdrawn.
+- **Outreach** — approval-gated planning surface for recruiters, hiring
+  managers, DMs and follow-ups. In this phase it shows honest "not connected"
+  states and does not send anything.
+- **Profile** — canonical career profile view, with edits routed through Config:
+  contact details, target roles, compensation/geography, standard answers,
+  resume variants, dream companies and excluded role types.
 - **Pipeline** — your tracker as a sortable, filterable table; status changes
   write back through the core's own scripts.
 - **Explore** — the free reverse-ATS scan with an honest partial-dataset
@@ -48,6 +60,7 @@ Open http://localhost:3000. The app reads the career-ops checkout it lives in
 npm run dev          # dev server (Turbopack)
 npx tsc --noEmit     # typecheck
 npm run build        # production build
+npm test             # web unit tests
 ```
 
 Set `CAREER_OPS_ROOT=/path/to/checkout` in `web/.env.local` to point the app at

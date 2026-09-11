@@ -24,7 +24,7 @@ export function WorkerPills() {
       <div className="mb-2 flex items-center gap-2 px-1">
         <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-faint">Workers</span>
         {running > 0 && <span className="text-[10px] tabular-nums text-brand">{running} running</span>}
-        <Link href="/jobs" className="ml-auto text-faint transition-colors hover:text-foreground" title="History" aria-label="Worker history">
+        <Link href="/workers" className="ml-auto text-faint transition-colors hover:text-foreground" title="History" aria-label="Worker history">
           <History className="size-3.5" />
         </Link>
         {finished > 0 && (
@@ -35,11 +35,11 @@ export function WorkerPills() {
       </div>
       <ul className="space-y-1.5">
         {jobs.slice(0, 6).map((j) => {
-          const active = pathname === `/jobs/${j.id}`;
+          const active = pathname === `/workers/${j.id}`;
           return (
             <li key={j.id}>
               <Link
-                href={`/jobs/${j.id}`}
+                href={`/workers/${j.id}`}
                 className={cn(
                   "group block rounded-lg border px-2.5 py-2 transition-colors",
                   active ? "border-brand/50 bg-brand-soft" : "border-border bg-surface/60 hover:bg-surface-hover",
