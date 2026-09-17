@@ -1,0 +1,26 @@
+import { NextRequest } from "next/server";
+import { decideApplicationPackage } from "@/lib/command-center/application-packages";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  let body: { packageHash?: string; decision?: "approved" | "rejected" };
+  try {
+    body = (await req.json()) as { packageHash?: string; decision?: "approved" | "rejected" };
+  } catch {
+    return Response.json({ error: "bad json" }, { status: 400 });
+  }
+
+  const packageHash = String(body.packageHash ?? "").trim();
+  const decision = body.decision;
+  if (!packageHash) return Response.json({ error: "packageHash is required" }, { status: 400 });
+  if (decision !== "approved" && decision !== "rejected") {
+    return Response.json({ error: "decision must be approved or rejected" }, { status: 400 });
+  }
+
+  const result = decideApplicationPackage(id, packageHash, decision);
+  if (!result.ok) return Response.json({ error: result.error }, { status: result.status });
+  return Response.json({ package: result.package });
+}

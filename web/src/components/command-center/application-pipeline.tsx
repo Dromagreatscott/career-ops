@@ -1,22 +1,19 @@
 import Link from "next/link";
-import { Columns3, ShieldCheck, Table2 } from "lucide-react";
+import { CheckCircle2, Clock3, Columns3, FileText, ShieldCheck, Table2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { CompanyLogo } from "@/components/company-logo";
 import { scoreTone } from "@/lib/format";
 import type { Application, ApplicationPackage, ApplicationStage, Approval } from "@/lib/command-center/types";
 
 const STAGES: ApplicationStage[] = [
-  "Discovered",
-  "Evaluating",
-  "Qualified",
   "Preparing",
+  "Needs David",
   "Ready for Review",
   "Approved",
+  "Submitting",
   "Submitted",
   "Interview",
-  "Rejected",
   "Closed",
-  "Withdrawn",
 ];
 
 export function ApplicationPipeline({
@@ -31,7 +28,7 @@ export function ApplicationPipeline({
   const grouped = new Map<ApplicationStage, Application[]>();
   for (const stage of STAGES) grouped.set(stage, []);
   for (const app of applications) grouped.get(app.stage)?.push(app);
-  const ready = applicationPackages.filter((pkg) => pkg.status === "ready_for_review" || pkg.status === "approved");
+  const ready = applicationPackages.filter((pkg) => pkg.status === "READY_FOR_REVIEW" || pkg.status === "APPROVED");
   const requiredApprovals = approvals.filter((approval) => approval.status === "required");
 
   return (
@@ -64,7 +61,7 @@ export function ApplicationPipeline({
         <div className="mt-3 grid gap-2 md:grid-cols-3">
           {ready.length ? ready.slice(0, 6).map((pkg) => <PackageCard key={`${pkg.jobId}-${pkg.status}`} pkg={pkg} />) : (
             <div className="rounded-md border border-dashed border-border px-3 py-5 text-sm text-muted md:col-span-3">
-              No application packages are ready for review yet. Preparing materials is approval-gated, and submission remains disabled until explicit approval.
+              No application packages are ready for review yet. Choose Prepare Application from a job card to create the first durable package.
             </div>
           )}
         </div>
@@ -126,6 +123,21 @@ function ApplicationCard({ application }: { application: Application }) {
           Package: {formatPackageStatus(application.applicationPackage.status)}
         </div>
       ) : null}
+      {application.applicationPackage ? (
+        <Link
+          href={`/applications/${application.applicationPackage.id}`}
+          className="mt-3 inline-flex min-h-10 w-full items-center justify-center gap-2 rounded-md bg-brand px-3 py-2 text-sm font-medium text-brand-foreground transition hover:bg-brand-200"
+        >
+          <FileText className="size-4" /> Review Application
+        </Link>
+      ) : application.jobId ? (
+        <Link
+          href={`/jobs/${application.jobId}`}
+          className="mt-3 inline-flex min-h-10 w-full items-center justify-center gap-2 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand"
+        >
+          <Clock3 className="size-4" /> View Job
+        </Link>
+      ) : null}
     </article>
   );
 }
@@ -138,18 +150,37 @@ function PackageCard({ pkg }: { pkg: ApplicationPackage }) {
           <h3 className="truncate text-sm font-medium text-foreground">{pkg.company}</h3>
           <p className="mt-0.5 line-clamp-2 text-xs text-muted">{pkg.title}</p>
         </div>
-        <Badge tone={pkg.status === "approved" ? "good" : "warn"}>{formatPackageStatus(pkg.status)}</Badge>
+        <Badge tone={pkg.status === "APPROVED" ? "good" : "warn"}>{formatPackageStatus(pkg.status)}</Badge>
       </div>
-      <p className="mt-2 text-xs leading-relaxed text-muted">{pkg.materialSummary}</p>
+      <div className="mt-3 grid gap-1.5 text-xs text-muted">
+        <PackageLine label="Profile fields complete" complete={pkg.questions.some((q) => q.classification === "SAFE_AUTOFILL")} />
+        <PackageLine label="Resume ready" complete={pkg.selectedResume.status === "ready"} />
+        <PackageLine label="Cover letter ready" complete={pkg.coverLetter.status === "ready" || pkg.coverLetter.status === "not_needed"} />
+        <PackageLine label={`${pkg.questions.filter((q) => q.classification !== "USER_REQUIRED").length} custom questions drafted`} complete />
+        <PackageLine label={`${pkg.questions.filter((q) => q.classification === "USER_REQUIRED").length} answer needs David`} complete={!pkg.questions.some((q) => q.classification === "USER_REQUIRED")} />
+      </div>
+      <p className="mt-2 text-xs leading-relaxed text-muted">Estimated review time: 3 minutes</p>
       <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+        <Link href={`/applications/${pkg.id}`} className="inline-flex items-center gap-1 rounded-md bg-brand px-2 py-1.5 font-medium text-brand-foreground">
+          Review
+        </Link>
         {pkg.reportHref ? <Link href={pkg.reportHref} className="text-brand hover:underline">Report</Link> : null}
         {pkg.canonicalApplyUrl ? <a href={pkg.canonicalApplyUrl} target="_blank" rel="noreferrer" className="text-brand hover:underline">ATS</a> : null}
-        <span className="text-faint">Submit approval required</span>
+        <span className="text-faint">Submission disabled</span>
       </div>
     </article>
   );
 }
 
+function PackageLine({ label, complete }: { label: string; complete: boolean }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <CheckCircle2 className={complete ? "size-3.5 text-emerald-600 dark:text-emerald-400" : "size-3.5 text-amber-600 dark:text-amber-400"} />
+      <span>{label}</span>
+    </div>
+  );
+}
+
 function formatPackageStatus(status: ApplicationPackage["status"]): string {
-  return status.replaceAll("_", " ");
+  return status.toLowerCase().replaceAll("_", " ");
 }

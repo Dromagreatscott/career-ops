@@ -3,6 +3,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { careerOpsRoot, readApplications } from "@/lib/career-ops";
 import { companyPrioritiesFromProfile, companyPriorityFor } from "./company-priority";
+import { findApplicationPackage, readApplicationPackages } from "./application-packages";
 import { canonicalApplyUrl, plainSummary, scoreValue, sourcePlatform, stableId, stageFromEvaluation, stageFromStatus, workArrangementFromText } from "./normalize";
 import type { Application, ApplicationPackage, Approval, AuditEvent, CommandCenterData, EducationItem, EmploymentHistoryItem, Evaluation, Job, Outreach, ProfileView } from "./types";
 
@@ -259,7 +260,7 @@ function pipelineJobs(): Job[] {
   });
 }
 
-function trackerApplications(jobs: Job[]): Application[] {
+function trackerApplications(jobs: Job[], packages: ApplicationPackage[]): Application[] {
   const byCompanyTitle = new Map<string, Job>();
   for (const job of jobs) byCompanyTitle.set(`${job.company.toLowerCase()}|${job.title.toLowerCase()}`, job);
   return readApplications().map((row) => {
@@ -282,80 +283,8 @@ function trackerApplications(jobs: Job[]): Application[] {
       notes: row.notes,
       updatedDate: row.date,
     };
-    app.applicationPackage = applicationPackageForApplication(app, row.pdf);
+    app.applicationPackage = packages.find((pkg) => pkg.jobId === app.jobId || pkg.trackerNumber === app.trackerNumber);
     return app;
-  });
-}
-
-function hasPreparedMaterial(pdfCell: string | undefined): boolean {
-  const text = String(pdfCell ?? "").trim();
-  return Boolean(text && !/^(?:-|—|❌|no|n\/a)$/i.test(text));
-}
-
-function packageStatusFor(app: Pick<Application, "stage" | "status">, pdfCell?: string): ApplicationPackage["status"] {
-  if (/approv/i.test(app.status) || app.stage === "Approved") return "approved";
-  if (app.stage === "Ready for Review" || hasPreparedMaterial(pdfCell)) return "ready_for_review";
-  if (app.stage === "Preparing") return "preparing";
-  return "not_started";
-}
-
-function applicationPackageForApplication(app: Application, pdfCell?: string): ApplicationPackage {
-  const status = packageStatusFor(app, pdfCell);
-  return {
-    jobId: app.jobId || app.id,
-    trackerNumber: app.trackerNumber,
-    company: app.company,
-    title: app.title,
-    status,
-    approvalRequired: "prepare_application",
-    submitApprovalRequired: "submit_application",
-    materialSummary: materialSummary(status),
-    canonicalApplyUrl: app.canonicalApplyUrl,
-    reportHref: app.reportHref,
-  };
-}
-
-function applicationPackageForJob(job: Job): ApplicationPackage {
-  const status: ApplicationPackage["status"] = job.trackerNumber ? packageStatusFor({ stage: job.stage, status: job.status ?? job.stage }) : "not_connected";
-  return {
-    jobId: job.id,
-    trackerNumber: job.trackerNumber,
-    company: job.company,
-    title: job.title,
-    status,
-    approvalRequired: "prepare_application",
-    submitApprovalRequired: "submit_application",
-    materialSummary: materialSummary(status),
-    canonicalApplyUrl: job.canonicalApplyUrl,
-    reportHref: job.reportHref,
-  };
-}
-
-function materialSummary(status: ApplicationPackage["status"]): string {
-  if (status === "approved") return "Application materials approved; external submission still requires explicit approval.";
-  if (status === "ready_for_review") return "Application materials are ready for human review.";
-  if (status === "preparing") return "Application materials are being prepared.";
-  if (status === "not_connected") return "No tracker-backed package exists yet.";
-  return "No application package has been prepared yet.";
-}
-
-function applicationPackages(jobs: Job[], applications: Application[]): ApplicationPackage[] {
-  const packages = new Map<string, ApplicationPackage>();
-  for (const app of applications) {
-    if (app.applicationPackage) packages.set(app.applicationPackage.jobId, app.applicationPackage);
-  }
-  for (const job of jobs) {
-    if (!packages.has(job.id)) packages.set(job.id, applicationPackageForJob(job));
-  }
-  return [...packages.values()].sort((a, b) => {
-    const order: Record<ApplicationPackage["status"], number> = {
-      ready_for_review: 0,
-      preparing: 1,
-      approved: 2,
-      not_started: 3,
-      not_connected: 4,
-    };
-    return order[a.status] - order[b.status] || a.company.localeCompare(b.company);
   });
 }
 
@@ -442,27 +371,63 @@ function profileView(profile: Record<string, unknown> | null): ProfileView {
   };
 }
 
+const OUTREACH_PLANS: Array<{
+  suffix: string;
+  targetType: Outreach["targetType"];
+  targetName: string;
+  approvalRequired: Outreach["approvalRequired"];
+}> = [
+  {
+    suffix: "hiring-manager",
+    targetType: "hiring_manager",
+    targetName: "Likely hiring manager not identified yet",
+    approvalRequired: "send_hiring_manager_message",
+  },
+  {
+    suffix: "recruiter",
+    targetType: "recruiter",
+    targetName: "Recruiter not identified yet",
+    approvalRequired: "send_recruiter_message",
+  },
+  {
+    suffix: "linkedin-dm",
+    targetType: "linkedin_dm",
+    targetName: "LinkedIn contact not identified yet",
+    approvalRequired: "send_recruiter_message",
+  },
+  {
+    suffix: "cold-dm",
+    targetType: "cold_dm",
+    targetName: "Cold outreach target not identified yet",
+    approvalRequired: "send_recruiter_message",
+  },
+  {
+    suffix: "follow-up",
+    targetType: "follow_up",
+    targetName: "Follow-up recipient not identified yet",
+    approvalRequired: "send_recruiter_message",
+  },
+  {
+    suffix: "application-follow-up",
+    targetType: "application_follow_up",
+    targetName: "Application follow-up recipient not identified yet",
+    approvalRequired: "send_recruiter_message",
+  },
+];
+
 function outreachFromJobs(jobs: Job[]): Outreach[] {
-  return jobs.slice(0, 8).flatMap((job) => [
-    {
-      id: `${job.id}-recruiter`,
+  return jobs.slice(0, 8).flatMap((job) =>
+    OUTREACH_PLANS.map((plan) => ({
+      id: `${job.id}-${plan.suffix}`,
       jobId: job.id,
       company: job.company,
       role: job.title,
-      targetType: "recruiter" as const,
+      targetType: plan.targetType,
+      targetName: plan.targetName,
       status: "not_connected" as const,
-      approvalRequired: "send_recruiter_message" as const,
-    },
-    {
-      id: `${job.id}-manager`,
-      jobId: job.id,
-      company: job.company,
-      role: job.title,
-      targetType: "hiring_manager" as const,
-      status: "not_connected" as const,
-      approvalRequired: "send_hiring_manager_message" as const,
-    },
-  ]);
+      approvalRequired: plan.approvalRequired,
+    })),
+  );
 }
 
 function auditEvents(): AuditEvent[] {
@@ -488,13 +453,13 @@ function auditEvents(): AuditEvent[] {
 function approvalsFromPackagesAndOutreach(packages: ApplicationPackage[], outreach: Outreach[]): Approval[] {
   const approvals: Approval[] = [];
   for (const pkg of packages) {
-    if (pkg.status === "not_started" || pkg.status === "preparing") {
+    if (pkg.status === "PREPARING") {
       approvals.push({ type: "prepare_application", status: "required", targetId: pkg.jobId });
     }
-    if (pkg.status === "ready_for_review") {
+    if (pkg.status === "READY_FOR_REVIEW") {
       approvals.push({ type: "submit_application", status: "required", targetId: pkg.jobId });
     }
-    if (pkg.status === "approved") {
+    if (pkg.status === "APPROVED") {
       approvals.push({ type: "submit_application", status: "approved", targetId: pkg.jobId });
     }
   }
@@ -516,9 +481,26 @@ function approvalsFromPackagesAndOutreach(packages: ApplicationPackage[], outrea
 
 export function commandCenterData(): CommandCenterData {
   const profile = readProfileYaml();
+  const profileData = profileView(profile);
   const jobs = mergeJobs();
-  const applications = trackerApplications(jobs);
-  const packages = applicationPackages(jobs, applications);
+  const packages = readApplicationPackages().sort((a, b) => {
+    const order: Record<ApplicationPackage["status"], number> = {
+      READY_FOR_REVIEW: 0,
+      USER_INTERVENTION_REQUIRED: 1,
+      PREPARING: 2,
+      APPROVED: 3,
+      SUBMITTING: 4,
+      SUBMITTED: 5,
+      INTERVIEW: 6,
+      QUALIFIED: 7,
+      EVALUATING: 8,
+      DISCOVERED: 9,
+      REJECTED: 10,
+      CLOSED: 11,
+    };
+    return order[a.status] - order[b.status] || a.company.localeCompare(b.company);
+  });
+  const applications = trackerApplications(jobs, packages);
   const outreach = outreachFromJobs(jobs);
   return {
     jobs,
@@ -527,10 +509,14 @@ export function commandCenterData(): CommandCenterData {
     outreach,
     approvals: approvalsFromPackagesAndOutreach(packages, outreach),
     auditEvents: auditEvents(),
-    profile: profileView(profile),
+    profile: profileData,
   };
 }
 
 export function findCommandCenterJob(id: string): Job | null {
   return commandCenterData().jobs.find((job) => job.id === id) ?? null;
+}
+
+export function findCommandCenterPackage(id: string): ApplicationPackage | null {
+  return findApplicationPackage(id);
 }

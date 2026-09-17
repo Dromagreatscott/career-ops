@@ -19,6 +19,7 @@ export function JobCardActions({ jobId, trackerNumber, applyHref, canonicalApply
   const router = useRouter();
   const [skipState, setSkipState] = useState<ActionState>("idle");
   const [saveState, setSaveState] = useState<ActionState>("idle");
+  const [prepareState, setPrepareState] = useState<ActionState>("idle");
 
   async function updateStatus(status: "SKIP" | "Evaluated", setState: (state: ActionState) => void) {
     if (!trackerNumber) {
@@ -38,6 +39,26 @@ export function JobCardActions({ jobId, trackerNumber, applyHref, canonicalApply
       window.setTimeout(() => setState("idle"), 1800);
     } catch {
       setState("error");
+    }
+  }
+
+  async function preparePackage() {
+    setPrepareState("saving");
+    try {
+      const res = await fetch("/api/applications/packages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId }),
+      });
+      if (!res.ok) throw new Error("package prepare failed");
+      const payload = (await res.json()) as { package?: { id?: string } };
+      const packageId = payload.package?.id;
+      if (!packageId) throw new Error("package id missing");
+      setPrepareState("saved");
+      router.push(`/applications/${packageId}`);
+      router.refresh();
+    } catch {
+      setPrepareState("error");
     }
   }
 
@@ -71,12 +92,17 @@ export function JobCardActions({ jobId, trackerNumber, applyHref, canonicalApply
       >
         <Bookmark className="size-4" /> {buttonLabel("Save", saveState)}
       </button>
-      <Link
-        href={`/apply?url=${encodeURIComponent(applyHref)}`}
-        className="inline-flex min-h-11 items-center justify-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand"
+      <button
+        type="button"
+        onClick={preparePackage}
+        disabled={prepareState === "saving"}
+        className={cn(
+          "inline-flex min-h-11 items-center justify-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand disabled:opacity-60",
+          prepareState === "error" && "border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-300",
+        )}
       >
-        <FileCheck2 className="size-4" /> Prepare
-      </Link>
+        <FileCheck2 className="size-4" /> {buttonLabel("Prepare", prepareState)}
+      </button>
       <Link
         href={`/jobs/${jobId}`}
         className="inline-flex min-h-11 items-center justify-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand"
