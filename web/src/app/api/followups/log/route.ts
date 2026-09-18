@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { careerOpsRoot } from "@/lib/career-ops";
+import { logInternalError } from "@/lib/security/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -27,8 +28,9 @@ export async function POST(req: Request) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     if (!fs.existsSync(file)) fs.writeFileSync(file, "# Follow-ups\n\n", "utf8");
     fs.appendFileSync(file, line, "utf8");
-  } catch (e) {
-    return Response.json({ error: e instanceof Error ? e.message : "write failed" }, { status: 500 });
+  } catch (error) {
+    logInternalError("followups.log", error);
+    return Response.json({ error: "Follow-up could not be logged." }, { status: 500 });
   }
   return Response.json({ ok: true });
 }

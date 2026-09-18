@@ -4,6 +4,7 @@ import path from "node:path";
 import { resolveCli } from "@/lib/clis";
 import { careerOpsRoot, readMemory } from "@/lib/career-ops";
 import { getSession } from "@/lib/apply/session";
+import { logInternalError } from "@/lib/security/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -107,9 +108,9 @@ export async function POST(req: Request) {
           /* ignore */
         }
       };
-      const fail = (m: string, raw?: string) => {
+      const fail = (m: string) => {
         log(`ERROR: ${m}`);
-        emit({ t: "error", m, raw });
+        emit({ t: "error", m });
         controller.close();
       };
       try {
@@ -121,7 +122,7 @@ export async function POST(req: Request) {
       const s = sessionId ? getSession(sessionId) : undefined;
       if (!s) return fail("apply session not found (it may have expired)");
       const resolved = cliId ? resolveCli(cliId) : null;
-      if (!resolved) return fail(`CLI '${cliId}' not found on this machine`);
+      if (!resolved) return fail("planner CLI is not available on this machine");
       const { spec, binPath } = resolved;
 
       const fieldsList = s.fields
@@ -172,7 +173,10 @@ Output ONLY a compact JSON object mapping each field id → {"value": "...", "ne
         });
         child.stderr.on("data", (d: Buffer) => {
           const e = d.toString().trim();
-          if (e) log(`stderr: ${e.slice(0, 160).replace(/\s+/g, " ")}`);
+          if (e) {
+            logInternalError("apply.prefill.stderr", new Error(e));
+            log("planner reported a diagnostic");
+          }
         });
         const killer = setTimeout(() => {
           log("TIMEOUT reached → SIGTERM");
@@ -190,14 +194,13 @@ Output ONLY a compact JSON object mapping each field id → {"value": "...", "ne
         child.on("error", (e) => {
           clearTimeout(killer);
           clearInterval(hb);
-          log(`spawn error: ${e.message}`);
+          logInternalError("apply.prefill.spawn", e);
+          log("planner could not be started");
           resolve({ buf, code: null, signal: null });
         });
       });
 
       log(`Planner exited code=${result.code} signal=${result.signal} · ${result.buf.length} chars total`);
-      log(`output head: ${result.buf.slice(0, 100).replace(/\s+/g, " ") || "(empty)"}`);
-      log(`output tail: ${result.buf.slice(-100).replace(/\s+/g, " ") || "(empty)"}`);
 
       if (!result.buf.trim()) {
         return fail(result.signal ? "planner was killed before producing any output (try again / smaller form)" : "planner produced no output (check the CLI works in this folder)");
@@ -207,7 +210,6 @@ Output ONLY a compact JSON object mapping each field id → {"value": "...", "ne
       if (!obj) {
         return fail(
           result.signal ? "planner was killed mid-answer (form too large/slow) — couldn't recover any fields" : "couldn't parse the planner's answer as JSON",
-          result.buf.slice(-300),
         );
       }
       const count = Object.keys(obj).length;

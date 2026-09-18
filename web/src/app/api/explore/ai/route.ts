@@ -4,6 +4,7 @@ import path from "node:path";
 import { resolveCli } from "@/lib/clis";
 import { careerOpsRoot, readMemory } from "@/lib/career-ops";
 import { assembleDedupContext } from "@/lib/core/discover";
+import { logInternalError } from "@/lib/security/errors";
 
 // AI search orchestrates modes/discover.md by running the USER'S configured CLI
 // headless (CLI-agnostic, like the assistant). Web hunting is slow → generous
@@ -39,7 +40,7 @@ export async function POST(req: Request) {
   if (!query || !cliId) return Response.json({ error: "query and cliId required" }, { status: 400 });
 
   const resolved = resolveCli(cliId);
-  if (!resolved) return Response.json({ error: `CLI '${cliId}' not found on this machine` }, { status: 404 });
+  if (!resolved) return Response.json({ error: "Configured CLI is not available." }, { status: 404 });
   const { spec, binPath } = resolved;
 
   // Read the CANONICAL mode at request time — single source of truth, never a
@@ -145,11 +146,13 @@ export async function POST(req: Request) {
       child.stderr.on("data", (d: Buffer) => {
         const s = d.toString();
         if (/error|not found|denied|fatal/i.test(s)) {
-          safeEnqueue(`\n[${spec.name}] ${s.trim()}\n`);
+          logInternalError("explore.ai.stderr", new Error(s));
+          safeEnqueue(`\n[${spec.name}] reported a diagnostic\n`);
         }
       });
       child.on("error", (e) => {
-        safeEnqueue(`\n[error launching ${spec.name}: ${e.message}]`);
+        logInternalError("explore.ai.spawn", e);
+        safeEnqueue(`\n[error launching ${spec.name}]`);
         safeClose();
       });
       child.on("close", () => {

@@ -5,6 +5,18 @@ import { careerOpsRoot } from "@/lib/career-ops";
 import { canonicalizeStatus } from "@/lib/core/states";
 import { atomicWrite } from "@/lib/core/safe-write";
 
+const PACKAGE_WORKFLOW_STATES = new Set([
+  "DISCOVERED",
+  "EVALUATING",
+  "QUALIFIED",
+  "PREPARING",
+  "READY_FOR_REVIEW",
+  "APPROVED",
+  "SUBMITTING",
+  "SUBMITTED",
+  "USER_INTERVENTION_REQUIRED",
+]);
+
 // Writeback: UPDATE the status cell of an EXISTING tracker row only. Never adds
 // rows — per the core data contract, new rows go through the TSV + merge flow.
 // HARDENED: validate against the 8 canonical states (states.yml SSOT); reject any
@@ -24,9 +36,12 @@ export async function POST(req: Request) {
   if (/[|\r\n*]/.test(status)) {
     return NextResponse.json({ error: "invalid status (table-breaking characters)" }, { status: 400 });
   }
+  if (PACKAGE_WORKFLOW_STATES.has(status.trim().toUpperCase())) {
+    return NextResponse.json({ error: "application package states must use the package workflow" }, { status: 400 });
+  }
   const canon = canonicalizeStatus(status);
   if (!canon) {
-    return NextResponse.json({ error: `not a canonical status: ${status}` }, { status: 400 });
+    return NextResponse.json({ error: "not a canonical tracker status" }, { status: 400 });
   }
 
   const file = path.join(careerOpsRoot(), "data", "applications.md");

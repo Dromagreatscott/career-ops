@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { resolveCli } from "@/lib/clis";
 import { careerOpsRoot } from "@/lib/career-ops";
+import { logInternalError } from "@/lib/security/errors";
 
 // Parse a CV (pasted text or an uploaded PDF) into clean cv.md markdown by running
 // the USER'S OWN CLI headless — the web never ships a heavyweight parser, and the
@@ -95,7 +96,7 @@ export async function POST(req: Request) {
   const resolved = resolveCli(cliId);
   if (!resolved) {
     if (tempFile) cleanupTemp(tempFile);
-    return Response.json({ error: `CLI '${cliId}' not found on this machine` }, { status: 404 });
+    return Response.json({ error: "CV parser CLI is not available on this machine" }, { status: 404 });
   }
   const { spec, binPath } = resolved;
   const prompt = ingestPrompt(promptSource);
@@ -120,9 +121,10 @@ export async function POST(req: Request) {
   let child;
   try {
     child = spawn(binPath, args, { cwd: careerOpsRoot(), env: process.env });
-  } catch (e) {
+  } catch (error) {
     if (tempFile) cleanupTemp(tempFile); // never leak the CV temp if spawn throws sync
-    return Response.json({ error: e instanceof Error ? e.message : "failed to start the CLI" }, { status: 500 });
+    logInternalError("cv.ingest.spawn", error);
+    return Response.json({ error: "Could not start the CV parser." }, { status: 500 });
   }
 
   const encoder = new TextEncoder();
@@ -197,10 +199,14 @@ export async function POST(req: Request) {
       });
       child.stderr.on("data", (d: Buffer) => {
         const s = d.toString();
-        if (/error|not found|denied|fatal/i.test(s)) safeEnqueue(`\n[${spec.name}] ${s.trim()}\n`);
+        if (/error|not found|denied|fatal/i.test(s)) {
+          logInternalError("cv.ingest.stderr", new Error(s));
+          safeEnqueue(`\n[${spec.name}] parser reported a diagnostic\n`);
+        }
       });
       child.on("error", (e) => {
-        safeEnqueue(`\n[error launching ${spec.name}: ${e.message}]`);
+        logInternalError("cv.ingest.child", e);
+        safeEnqueue(`\n[error launching ${spec.name}]`);
         safeClose();
       });
       child.on("close", () => {

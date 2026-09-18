@@ -1,6 +1,7 @@
 import { getSession, finalizeDrivenSession, extractCurrent, isApplicationFormFn, handoffSession } from "@/lib/apply/session";
 import { driveSession } from "@/lib/apply/drive";
 import { classifyEmpty } from "@/lib/apply/diagnose";
+import { logInternalError } from "@/lib/security/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -62,8 +63,9 @@ export async function POST(req: Request) {
         // Didn't reach a real form → classify why for a clear message.
         const why = await classifyEmpty(page, s.url).catch(() => ({ message: "Couldn't reach a fillable form on this page." }));
         emit({ t: "error", reason: result.reason, message: result.reason === "stuck" ? result.steps.at(-1)?.detail || why.message : why.message });
-      } catch (e) {
-        emit({ t: "error", message: e instanceof Error ? e.message.slice(0, 160) : "drive failed" });
+      } catch (error) {
+        logInternalError("apply.drive", error, { sessionId: s.id });
+        emit({ t: "error", message: "Application drive failed. Check the server logs and try again." });
       } finally {
         controller.close();
       }

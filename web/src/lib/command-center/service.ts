@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
 import { careerOpsRoot, readApplications } from "@/lib/career-ops";
+import { normalizeExternalUrl } from "@/lib/security/url";
 import { companyPrioritiesFromProfile, companyPriorityFor } from "./company-priority";
 import { findApplicationPackage, readApplicationPackages } from "./application-packages";
 import { canonicalApplyUrl, plainSummary, scoreValue, sourcePlatform, stableId, stageFromEvaluation, stageFromStatus, workArrangementFromText } from "./normalize";
@@ -133,11 +134,12 @@ function parsePipeline(): PipelineEntry[] {
     const match = line.match(/^\s*-\s*\[([ xX])\]\s*(.+)$/);
     if (!match) continue;
     const parts = match[2].split("|").map((part) => part.trim()).filter(Boolean);
-    if (parts.length < 3 || !/^https?:\/\//i.test(parts[0])) continue;
+    const normalizedUrl = normalizeExternalUrl(parts[0]);
+    if (parts.length < 3 || !normalizedUrl) continue;
     const extras = parts.slice(3);
     const entry: PipelineEntry = {
       done: match[1].toLowerCase() === "x",
-      url: parts[0],
+      url: normalizedUrl,
       company: parts[1],
       title: parts[2],
       rawNotes: extras.join(" | ") || undefined,
@@ -197,15 +199,16 @@ function hawkeyeJobs(): Job[] {
   const payload = readJson<{ jobs?: HawkeyeJob[] }>("data/hawkeye/jobs.json", { jobs: [] });
   const profile = readProfileYaml();
   const priorities = companyPrioritiesFromProfile(profile);
-  return (payload.jobs ?? []).map((job) => {
+  return (payload.jobs ?? []).flatMap((job) => {
     const company = field(job, "company");
     const title = field(job, "title");
-    const sourceUrl = field(job, "source_url");
+    const sourceUrl = normalizeExternalUrl(field(job, "source_url"));
+    if (!sourceUrl) return [];
     const evaluation = evaluationFromHawkeye(job);
     const priority = companyPriorityFor(company, priorities);
     const canonical = canonicalApplyUrl(sourceUrl);
     const score = evaluation?.score ?? null;
-    return {
+    return [{
       id: job.job_id || stableId("hawkeye", sourceUrl || `${company}-${title}`),
       company,
       title,
@@ -226,7 +229,7 @@ function hawkeyeJobs(): Job[] {
       dreamCompany: priority.tier === 1,
       stage: stageFromEvaluation(evaluation?.status, score),
       status: job.decision?.state,
-    };
+    }];
   });
 }
 
@@ -432,8 +435,10 @@ function outreachFromJobs(jobs: Job[]): Outreach[] {
 
 function auditEvents(): AuditEvent[] {
   const raw = readText("data/hawkeye/audit.jsonl");
-  if (!raw) return [];
-  return raw.split("\n").slice(-20).flatMap((line) => {
+  const packageRaw = readText("data/application-packages/package-audit.jsonl");
+  const events: AuditEvent[] = [];
+  if (raw) {
+    events.push(...raw.split("\n").slice(-20).flatMap((line) => {
     if (!line.trim()) return [];
     try {
       const parsed = JSON.parse(line) as Record<string, unknown>;
@@ -447,7 +452,25 @@ function auditEvents(): AuditEvent[] {
     } catch {
       return [];
     }
-  });
+    }));
+  }
+  if (packageRaw) {
+    events.push(...packageRaw.split("\n").slice(-20).flatMap((line) => {
+      if (!line.trim()) return [];
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        return [{
+          timestamp: String(parsed.ts ?? ""),
+          type: String(parsed.type ?? "application_package_audit"),
+          targetId: String(parsed.packageId ?? "unknown"),
+          summary: "Application package was isolated for operator review.",
+        }];
+      } catch {
+        return [];
+      }
+    }));
+  }
+  return events.slice(-40);
 }
 
 function approvalsFromPackagesAndOutreach(packages: ApplicationPackage[], outreach: Outreach[]): Approval[] {

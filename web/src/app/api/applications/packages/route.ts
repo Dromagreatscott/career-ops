@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { prepareApplicationPackage } from "@/lib/command-center/application-packages";
 import { commandCenterData } from "@/lib/command-center/service";
+import { logInternalError } from "@/lib/security/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,6 +21,11 @@ export async function POST(req: NextRequest) {
   const job = data.jobs.find((item) => item.id === jobId);
   if (!job) return Response.json({ error: "job not found" }, { status: 404 });
 
-  const pkg = prepareApplicationPackage(job, data.profile);
-  return Response.json({ package: pkg });
+  try {
+    const pkg = prepareApplicationPackage(job, data.profile);
+    return Response.json({ package: pkg });
+  } catch (error) {
+    logInternalError("applications.packages.prepare", error, { jobId });
+    return Response.json({ error: "application package could not be prepared" }, { status: 500 });
+  }
 }

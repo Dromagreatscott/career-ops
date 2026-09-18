@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { atomicWrite } from "@/lib/core/safe-write";
 import { careerOpsRoot } from "@/lib/career-ops";
+import { normalizeExternalUrl } from "@/lib/security/url";
 import { detectAts } from "./ats-adapters";
 import type {
   ApplicationPackage,
@@ -16,13 +17,80 @@ import type {
 const PACKAGE_DIR = "data/application-packages";
 const SCHEMA_VERSION = 1;
 const MASTER_RESUME = "data/David_Scott_AI_Resume_2026_v4_4_MASTER_ATS.pdf";
+const PACKAGE_ID_RE = /^pkg_[a-f0-9]{16}$/;
+const HASH_RE = /^[a-f0-9]{64}$/;
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+const PACKAGE_AUDIT_LOG = "package-audit.jsonl";
+const QUARANTINE_DIR = "quarantine";
+
+type PackageValidationErrorCode =
+  | "invalid_id"
+  | "invalid_path"
+  | "bad_json"
+  | "bad_schema"
+  | "hash_mismatch"
+  | "not_found"
+  | "invalid_transition"
+  | "stale_version"
+  | "stale_hash"
+  | "already_decided";
+
+type PackageReadError = {
+  ok: false;
+  status: number;
+  error: string;
+  code: PackageValidationErrorCode;
+};
+
+type PackageReadOk = {
+  ok: true;
+  package: ApplicationPackage;
+};
+
+type PackageReadResult = PackageReadOk | PackageReadError;
+
+const BASELINE_TRANSITIONS: Record<ApplicationPackageStatus, ApplicationPackageStatus[]> = {
+  DISCOVERED: ["EVALUATING"],
+  EVALUATING: ["QUALIFIED"],
+  QUALIFIED: ["PREPARING"],
+  PREPARING: ["READY_FOR_REVIEW", "USER_INTERVENTION_REQUIRED"],
+  READY_FOR_REVIEW: ["APPROVED", "REJECTED"],
+  APPROVED: ["SUBMITTING"],
+  SUBMITTING: ["SUBMITTED", "USER_INTERVENTION_REQUIRED"],
+  SUBMITTED: [],
+  USER_INTERVENTION_REQUIRED: ["PREPARING", "SUBMITTING"],
+  INTERVIEW: [],
+  CLOSED: [],
+  REJECTED: [],
+};
 
 function packageDir(): string {
   return path.join(careerOpsRoot(), PACKAGE_DIR);
 }
 
+export function validatePackageId(value: unknown): { ok: true; id: string } | PackageReadError {
+  if (typeof value !== "string") return packageError(400, "invalid_id", "invalid package id");
+  const raw = value.trim();
+  if (raw !== value || !raw) return packageError(400, "invalid_id", "invalid package id");
+  try {
+    decodeURIComponent(raw);
+  } catch {
+    return packageError(400, "invalid_id", "invalid package id");
+  }
+  if (raw.includes("/") || raw.includes("\\") || path.isAbsolute(raw) || !PACKAGE_ID_RE.test(raw)) {
+    return packageError(400, "invalid_id", "invalid package id");
+  }
+  return { ok: true, id: raw };
+}
+
 function packagePath(id: string): string {
-  return path.join(packageDir(), `${id}.json`);
+  const base = path.resolve(packageDir());
+  const file = path.resolve(base, `${id}.json`);
+  const relative = path.relative(base, file);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("package path escaped package directory");
+  }
+  return file;
 }
 
 function safeId(value: string): string {
@@ -33,12 +101,43 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function readJsonFile<T>(file: string): T | null {
+function packageError(status: number, code: PackageValidationErrorCode, error: string): PackageReadError {
+  return { ok: false, status, code, error };
+}
+
+function readJsonFile(file: string): unknown | null {
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8")) as T;
+    return JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
   } catch {
     return null;
   }
+}
+
+function auditPackageEvent(type: string, details: Record<string, unknown>) {
+  const event = { ts: nowIso(), type, ...details };
+  try {
+    fs.mkdirSync(packageDir(), { recursive: true });
+    fs.appendFileSync(path.join(packageDir(), PACKAGE_AUDIT_LOG), `${JSON.stringify(event)}\n`, "utf8");
+  } catch {
+    /* best-effort audit */
+  }
+  console.warn(JSON.stringify({ scope: "application-package", ...event }));
+}
+
+function quarantinePackageFile(file: string, code: PackageValidationErrorCode, packageId?: string) {
+  const base = path.resolve(packageDir());
+  const resolved = path.resolve(file);
+  const relative = path.relative(base, resolved);
+  if (relative.startsWith("..") || path.isAbsolute(relative) || relative.includes(path.sep + QUARANTINE_DIR + path.sep)) return;
+  const safeName = path.basename(file).replace(/[^a-zA-Z0-9._-]/g, "_");
+  try {
+    fs.mkdirSync(path.join(base, QUARANTINE_DIR), { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    fs.renameSync(resolved, path.join(base, QUARANTINE_DIR, `${safeName}.bad-${stamp}`));
+  } catch {
+    /* best-effort quarantine */
+  }
+  auditPackageEvent("application_package_quarantined", { code, packageId: packageId ?? "unknown" });
 }
 
 function hasResume(): boolean {
@@ -60,6 +159,126 @@ export function computePackageHash(pkg: Omit<ApplicationPackage, "packageHash">)
 
 function withHash(pkg: Omit<ApplicationPackage, "packageHash">): ApplicationPackage {
   return { ...pkg, packageHash: computePackageHash(pkg) };
+}
+
+function recomputePackageHash(pkg: ApplicationPackage): string {
+  const { packageHash: _packageHash, ...withoutHash } = pkg;
+  return computePackageHash(withoutHash);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isIso(value: unknown): value is string {
+  return typeof value === "string" && ISO_RE.test(value) && Number.isFinite(Date.parse(value));
+}
+
+function stringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isPackageStatus(value: unknown): value is ApplicationPackageStatus {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(BASELINE_TRANSITIONS, value);
+}
+
+function validateApproval(pkg: Record<string, unknown>): boolean {
+  const approval = pkg.approval;
+  if (approval === undefined) return true;
+  if (!isRecord(approval)) return false;
+  if (approval.status !== "approved" && approval.status !== "rejected") return false;
+  if (typeof approval.packageHash !== "string" || !HASH_RE.test(approval.packageHash)) return false;
+  if (!isIso(approval.decidedAt)) return false;
+  return approval.packageHash === pkg.packageHash;
+}
+
+function validateApplicationQuestion(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (!isString(value.id) || !isString(value.label) || !isString(value.explanation)) return false;
+  if (value.classification !== "SAFE_AUTOFILL" && value.classification !== "REVIEW_REQUIRED" && value.classification !== "USER_REQUIRED") return false;
+  if (value.source !== "profile" && value.source !== "career_ops" && value.source !== "user") return false;
+  if (value.value !== undefined && typeof value.value !== "string") return false;
+  if (value.draft !== undefined && typeof value.draft !== "string") return false;
+  return true;
+}
+
+function validateApplicationPackageShape(value: unknown): value is ApplicationPackage {
+  if (!isRecord(value)) return false;
+  if (value.schemaVersion !== SCHEMA_VERSION) return false;
+  if (!validatePackageId(value.id).ok) return false;
+  if (!isString(value.jobId)) return false;
+  if (value.trackerNumber !== undefined && typeof value.trackerNumber !== "string") return false;
+  if (typeof value.version !== "number" || !Number.isSafeInteger(value.version) || value.version < 1) return false;
+  if (typeof value.packageHash !== "string" || !HASH_RE.test(value.packageHash)) return false;
+  if (!isString(value.company) || !isString(value.title)) return false;
+  if (!isPackageStatus(value.status)) return false;
+  if (value.approvalRequired !== "prepare_application" || value.submitApprovalRequired !== "submit_application") return false;
+  if (!isString(value.materialSummary)) return false;
+  if (value.atsType !== "greenhouse" && value.atsType !== "lever" && value.atsType !== "ashby" && value.atsType !== "workday" && value.atsType !== "unknown") return false;
+  if (!isString(value.canonicalJobUrl) || !normalizeExternalUrl(value.canonicalJobUrl)) return false;
+  if (value.canonicalApplyUrl !== undefined && !normalizeExternalUrl(value.canonicalApplyUrl)) return false;
+  if (value.baseRoleFit !== null && (typeof value.baseRoleFit !== "number" || !Number.isFinite(value.baseRoleFit))) return false;
+  if (value.compensationStatus !== "preferred" && value.compensationStatus !== "eligible_unknown" && value.compensationStatus !== "comp_exception_low_priority" && value.compensationStatus !== "unknown") return false;
+  if (!stringArray(value.roleFitExplanation)) return false;
+  if (!isRecord(value.selectedResume) || !isString(value.selectedResume.label)) return false;
+  if (value.selectedResume.path !== undefined && typeof value.selectedResume.path !== "string") return false;
+  if (value.selectedResume.status !== "ready" && value.selectedResume.status !== "pending") return false;
+  if (!stringArray(value.tailoredResumeChanges)) return false;
+  if (!isRecord(value.coverLetter) || typeof value.coverLetter.useful !== "boolean") return false;
+  if (value.coverLetter.status !== "ready" && value.coverLetter.status !== "not_needed" && value.coverLetter.status !== "pending") return false;
+  if (value.coverLetter.draft !== undefined && typeof value.coverLetter.draft !== "string") return false;
+  if (!Array.isArray(value.questions) || !value.questions.every(validateApplicationQuestion)) return false;
+  if (value.outreachDraft !== undefined) {
+    if (!isRecord(value.outreachDraft)) return false;
+    if (value.outreachDraft.channel !== "linkedin_dm" && value.outreachDraft.channel !== "email") return false;
+    if (!isString(value.outreachDraft.body)) return false;
+    if (value.outreachDraft.status !== "draft_ready" && value.outreachDraft.status !== "pending") return false;
+  }
+  if (!validateApproval(value)) return false;
+  if (value.reportHref !== undefined && typeof value.reportHref !== "string") return false;
+  if (!isIso(value.createdAt) || !isIso(value.updatedAt)) return false;
+  return true;
+}
+
+export function canTransitionPackageStatus(from: ApplicationPackageStatus, to: ApplicationPackageStatus): boolean {
+  if (from === to) return true;
+  return BASELINE_TRANSITIONS[from]?.includes(to) ?? false;
+}
+
+function assertPackageStatusTransition(from: ApplicationPackageStatus, to: ApplicationPackageStatus): PackageReadError | null {
+  if (canTransitionPackageStatus(from, to)) return null;
+  return packageError(409, "invalid_transition", "invalid application package transition");
+}
+
+function readApplicationPackageFromPath(file: string, expectedId?: string, quarantine = true): PackageReadResult {
+  const parsed = readJsonFile(file);
+  const packageId = isRecord(parsed) && typeof parsed.id === "string" ? parsed.id : expectedId;
+  if (!parsed) {
+    if (quarantine) quarantinePackageFile(file, "bad_json", packageId);
+    return packageError(422, "bad_json", "application package is invalid and has been isolated");
+  }
+  if (!validateApplicationPackageShape(parsed)) {
+    if (quarantine) quarantinePackageFile(file, "bad_schema", packageId);
+    return packageError(422, "bad_schema", "application package is invalid and has been isolated");
+  }
+  if (expectedId && parsed.id !== expectedId) {
+    if (quarantine) quarantinePackageFile(file, "bad_schema", parsed.id);
+    return packageError(422, "bad_schema", "application package is invalid and has been isolated");
+  }
+  const actualHash = recomputePackageHash(parsed);
+  if (actualHash !== parsed.packageHash) {
+    if (quarantine) quarantinePackageFile(file, "hash_mismatch", parsed.id);
+    return packageError(409, "hash_mismatch", "application package changed unexpectedly and has been isolated");
+  }
+  if (parsed.approval && parsed.approval.packageHash !== actualHash) {
+    if (quarantine) quarantinePackageFile(file, "hash_mismatch", parsed.id);
+    return packageError(409, "hash_mismatch", "application package approval is stale and has been isolated");
+  }
+  return { ok: true, package: parsed };
 }
 
 function compensationStatus(compensation?: string): CompensationStatus {
@@ -136,7 +355,10 @@ export function buildApplicationPackage(
   options: { status?: ApplicationPackageStatus; existing?: ApplicationPackage } = {},
 ): ApplicationPackage {
   const timestamp = nowIso();
-  const atsRef = detectAts(job.canonicalApplyUrl || job.sourceUrl);
+  const canonicalJobUrl = normalizeExternalUrl(job.sourceUrl);
+  if (!canonicalJobUrl) throw new Error("job source URL is not a valid external URL");
+  const canonicalApply = normalizeExternalUrl(job.canonicalApplyUrl) ?? canonicalJobUrl;
+  const atsRef = detectAts(canonicalApply);
   const resumeReady = hasResume();
   const status = options.status ?? options.existing?.status ?? "READY_FOR_REVIEW";
   const base: Omit<ApplicationPackage, "packageHash"> = {
@@ -152,8 +374,8 @@ export function buildApplicationPackage(
     submitApprovalRequired: "submit_application",
     materialSummary: "Application package created for David review. External submission is disabled.",
     atsType: atsRef?.atsType ?? "unknown",
-    canonicalJobUrl: job.sourceUrl,
-    canonicalApplyUrl: job.canonicalApplyUrl || job.sourceUrl,
+    canonicalJobUrl,
+    canonicalApplyUrl: canonicalApply,
     baseRoleFit: job.fitScore,
     compensationStatus: compensationStatus(job.compensation),
     roleFitExplanation: roleFitExplanation(job),
@@ -178,28 +400,59 @@ export function buildApplicationPackage(
     createdAt: options.existing?.createdAt ?? timestamp,
     updatedAt: timestamp,
   };
-  return withHash(base);
+  const next = withHash(base);
+  if (options.existing && next.packageHash !== options.existing.packageHash) {
+    return withHash({
+      ...base,
+      status: "READY_FOR_REVIEW",
+      approval: undefined,
+      version: options.existing.version + 1,
+    });
+  }
+  return next;
 }
 
 export function readApplicationPackages(): ApplicationPackage[] {
-  let files: string[] = [];
+  let files: fs.Dirent[] = [];
   try {
-    files = fs.readdirSync(packageDir()).filter((file: string) => file.endsWith(".json"));
+    files = fs.readdirSync(packageDir(), { withFileTypes: true }).filter((file) => file.isFile() && file.name.endsWith(".json"));
   } catch {
     return [];
   }
-  return files.flatMap((file: string) => {
-    const parsed = readJsonFile<ApplicationPackage>(path.join(packageDir(), file));
-    return parsed ? [parsed] : [];
+  return files.flatMap((file) => {
+    const id = file.name.replace(/\.json$/, "");
+    const validId = validatePackageId(id);
+    if (!validId.ok) {
+      quarantinePackageFile(path.join(packageDir(), file.name), "invalid_id", id);
+      return [];
+    }
+    const parsed = readApplicationPackageFromPath(path.join(packageDir(), file.name), validId.id);
+    return parsed.ok ? [parsed.package] : [];
   });
 }
 
 export function findApplicationPackage(id: string): ApplicationPackage | null {
-  const parsed = readJsonFile<ApplicationPackage>(packagePath(id));
-  return parsed ?? null;
+  const result = readApplicationPackage(id);
+  return result.ok ? result.package : null;
+}
+
+export function readApplicationPackage(id: string): PackageReadResult {
+  const validId = validatePackageId(id);
+  if (!validId.ok) return validId;
+  let file: string;
+  try {
+    file = packagePath(validId.id);
+  } catch {
+    return packageError(400, "invalid_path", "invalid package id");
+  }
+  if (!fs.existsSync(file)) return packageError(404, "not_found", "application package not found");
+  return readApplicationPackageFromPath(file, validId.id);
 }
 
 export function writeApplicationPackage(pkg: ApplicationPackage): ApplicationPackage {
+  if (!validateApplicationPackageShape(pkg)) throw new Error("invalid application package");
+  const actualHash = recomputePackageHash(pkg);
+  if (actualHash !== pkg.packageHash) throw new Error("application package hash mismatch");
   fs.mkdirSync(packageDir(), { recursive: true });
   atomicWrite(packagePath(pkg.id), `${JSON.stringify(pkg, null, 2)}\n`);
   return pkg;
@@ -207,23 +460,40 @@ export function writeApplicationPackage(pkg: ApplicationPackage): ApplicationPac
 
 export function prepareApplicationPackage(job: Job, profile: ProfileView): ApplicationPackage {
   const existing = findApplicationPackage(safeId(job.id)) ?? undefined;
-  const pkg = buildApplicationPackage(job, profile, { existing, status: "READY_FOR_REVIEW" });
+  const requestedStatus = existing?.status === "APPROVED" ? existing.status : "READY_FOR_REVIEW";
+  const pkg = buildApplicationPackage(job, profile, { existing, status: requestedStatus });
   return writeApplicationPackage(pkg);
 }
 
 export function decideApplicationPackage(
   id: string,
   packageHash: string,
+  expectedVersion: number,
   decision: "approved" | "rejected",
 ): { ok: true; package: ApplicationPackage } | { ok: false; status: number; error: string } {
-  const existing = findApplicationPackage(id);
-  if (!existing) return { ok: false, status: 404, error: "application package not found" };
-  if (existing.packageHash !== packageHash) {
+  const read = readApplicationPackage(id);
+  if (!read.ok) return { ok: false, status: read.status, error: read.error };
+  const existing = read.package;
+  const actualHash = recomputePackageHash(existing);
+  if (actualHash !== existing.packageHash) {
+    auditPackageEvent("application_package_hash_mismatch", { packageId: existing.id });
     return { ok: false, status: 409, error: "package changed after review; reload before deciding" };
   }
+  if (existing.packageHash !== packageHash || actualHash !== packageHash) {
+    return { ok: false, status: 409, error: "package changed after review; reload before deciding" };
+  }
+  if (existing.version !== expectedVersion) {
+    return { ok: false, status: 409, error: "package version changed after review; reload before deciding" };
+  }
+  if (existing.status === "APPROVED" || existing.status === "REJECTED") {
+    return { ok: false, status: 409, error: "package decision was already recorded" };
+  }
+  const targetStatus = decision === "approved" ? "APPROVED" : "REJECTED";
+  const transitionError = assertPackageStatusTransition(existing.status, targetStatus);
+  if (transitionError) return { ok: false, status: transitionError.status, error: transitionError.error };
   const updated: ApplicationPackage = {
     ...existing,
-    status: decision === "approved" ? "APPROVED" : "REJECTED",
+    status: targetStatus,
     approval: {
       status: decision,
       packageHash,

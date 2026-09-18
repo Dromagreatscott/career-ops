@@ -1,4 +1,5 @@
 import type { ApplicationStage } from "./types";
+import { normalizeExternalUrl, validateExternalUrl } from "@/lib/security/url";
 
 export function stableId(prefix: string, value: string): string {
   let h = 2166136261;
@@ -18,7 +19,8 @@ export function scoreValue(value: string | number | null | undefined): number | 
 }
 
 export function sourcePlatform(url: string): string {
-  const host = safeHost(url);
+  const parsed = validateExternalUrl(url);
+  const host = parsed.ok ? parsed.parsed.hostname.toLowerCase() : "";
   if (!host) return "Unknown";
   if (host.includes("greenhouse.io")) return "Greenhouse";
   if (host.includes("ashbyhq.com")) return "Ashby";
@@ -34,11 +36,13 @@ export function sourcePlatform(url: string): string {
 }
 
 export function canonicalApplyUrl(url: string): string | undefined {
-  const host = safeHost(url);
+  const parsed = validateExternalUrl(url);
+  if (!parsed.ok) return undefined;
+  const host = parsed.parsed.hostname.toLowerCase();
   if (!host) return undefined;
   const aggregator = /(linkedin|indeed|glassdoor|ziprecruiter|builtin|wellfound|jobright|ihire|jobs-in)\./i;
   if (aggregator.test(host)) return undefined;
-  return url;
+  return normalizeExternalUrl(url);
 }
 
 export function workArrangementFromText(...values: Array<string | undefined>): string | undefined {
@@ -88,12 +92,4 @@ export function plainSummary(parts: {
     return "Looks aligned on title; Career Ops evaluation is still needed.";
   }
   return "Not scored yet; review the official posting before acting.";
-}
-
-function safeHost(url: string): string {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return "";
-  }
 }

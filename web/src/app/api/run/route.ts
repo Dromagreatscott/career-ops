@@ -4,6 +4,7 @@ import path from "node:path";
 import { resolveCli } from "@/lib/clis";
 import { careerOpsRoot, readMemory } from "@/lib/career-ops";
 import { acquireTrackerWrite, releaseTrackerWrite } from "@/lib/core/run-registry";
+import { logInternalError } from "@/lib/security/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -77,7 +78,7 @@ export async function POST(req: Request) {
   }
   const resolved = resolveCli(cliId);
   if (!resolved) {
-    return new Response(JSON.stringify({ error: `CLI '${cliId}' not found` }), {
+    return new Response(JSON.stringify({ error: "Configured CLI is not available." }), {
       status: 404,
       headers: { "Content-Type": "application/json" },
     });
@@ -91,7 +92,7 @@ export async function POST(req: Request) {
   if (required && !fs.existsSync(path.join(careerOpsRoot(), required))) {
     return new Response(
       JSON.stringify({
-        error: `This needs a complete career-ops checkout (${required}). CAREER_OPS_ROOT has data only — point it at a full checkout.`,
+        error: "This needs a complete career-ops checkout.",
       }),
       { status: 400, headers: { "Content-Type": "application/json" } },
     );
@@ -219,10 +220,15 @@ export async function POST(req: Request) {
         // the old narrow regex missed them (silent false "success").
         if (/error|denied|fatal|not found|unauthorized|forbidden|auth|login|credential|api[ -]?key|quota|rate limit|not authenticated/i.test(s)) {
           sawError = true;
-          send({ type: "error", msg: s.trim().slice(0, 200) });
+          logInternalError("run.stderr", new Error(s), { kind });
+          send({ type: "error", msg: "The CLI reported an error. Check the server logs and try again." });
         }
       });
-      child.on("error", (e) => { send({ type: "error", msg: e.message }); close(); });
+      child.on("error", (e) => {
+        logInternalError("run.spawn", e, { kind });
+        send({ type: "error", msg: "Could not start the CLI." });
+        close();
+      });
       child.on("close", (code) => {
         const wroteReport = countReports() > reportsBefore;
         const cleanExit = code === 0; // non-zero OR null (killed/signal) = NOT clean

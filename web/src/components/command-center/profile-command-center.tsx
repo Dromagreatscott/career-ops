@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { BriefcaseBusiness, GraduationCap, LinkIcon, MapPin, Pencil, ShieldCheck, Sparkles, UserRound } from "lucide-react";
 import type { ProfileView } from "@/lib/command-center/types";
+import { safeExternalHref } from "@/lib/security/url";
 
 export function ProfileCommandCenter({ profile }: { profile: ProfileView }) {
   return (
@@ -85,11 +86,14 @@ export function ProfileCommandCenter({ profile }: { profile: ProfileView }) {
             <LinkIcon className="size-4 text-brand" /> Portfolio
           </h2>
           <div className="mt-3 space-y-2">
-            {profile.portfolio.length ? profile.portfolio.map((item) => (
-              <a key={item} href={item.startsWith("http") ? item : `https://${item}`} target="_blank" rel="noreferrer" className="block truncate rounded-md bg-background/45 px-3 py-2 text-sm text-brand-text hover:underline">
-                {item}
-              </a>
-            )) : (
+            {profile.portfolio.length ? profile.portfolio.map((item) => {
+              const href = safeExternalHref(item.startsWith("http") ? item : `https://${item}`);
+              return href ? (
+                <a key={item} href={href} target="_blank" rel="noreferrer" className="block truncate rounded-md bg-background/45 px-3 py-2 text-sm text-brand-text hover:underline">
+                  {item}
+                </a>
+              ) : null;
+            }) : (
               <div className="rounded-md border border-dashed border-border px-3 py-5 text-sm text-muted">Portfolio links are not connected yet.</div>
             )}
           </div>

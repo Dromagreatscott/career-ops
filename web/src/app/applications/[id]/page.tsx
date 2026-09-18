@@ -131,7 +131,12 @@ export default async function ApplicationReviewPage({ params }: { params: Promis
             <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-muted">Approval</h2>
             <p className="mt-3 break-all rounded-md bg-background/45 px-3 py-2 text-xs text-faint">Hash: {applicationPackage.packageHash}</p>
             <div className="mt-4">
-              <PackageDecisionActions packageId={applicationPackage.id} packageHash={applicationPackage.packageHash} status={applicationPackage.status} />
+              <PackageDecisionActions
+                packageId={applicationPackage.id}
+                packageHash={applicationPackage.packageHash}
+                version={applicationPackage.version}
+                status={applicationPackage.status}
+              />
             </div>
           </section>
 

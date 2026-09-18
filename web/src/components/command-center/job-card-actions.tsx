@@ -11,7 +11,7 @@ type ActionState = "idle" | "saving" | "saved" | "blocked" | "error";
 type Props = {
   jobId: string;
   trackerNumber?: string;
-  applyHref: string;
+  applyHref?: string;
   canonicalApplyResolved: boolean;
 };
 
@@ -109,19 +109,29 @@ export function JobCardActions({ jobId, trackerNumber, applyHref, canonicalApply
       >
         <FileText className="size-4" /> Details
       </Link>
-      <a
-        href={applyHref}
-        target="_blank"
-        rel="noreferrer"
-        className={cn(
-          "inline-flex min-h-11 items-center justify-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition",
-          canonicalApplyResolved
-            ? "bg-brand text-brand-foreground hover:bg-brand-200"
-            : "border border-amber-500/40 bg-amber-500/10 text-amber-800 hover:bg-amber-500/15 dark:text-amber-300",
-        )}
-      >
-        <ExternalLink className="size-4" /> Open ATS
-      </a>
+      {applyHref ? (
+        <a
+          href={applyHref}
+          target="_blank"
+          rel="noreferrer"
+          className={cn(
+            "inline-flex min-h-11 items-center justify-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium transition",
+            canonicalApplyResolved
+              ? "bg-brand text-brand-foreground hover:bg-brand-200"
+              : "border border-amber-500/40 bg-amber-500/10 text-amber-800 hover:bg-amber-500/15 dark:text-amber-300",
+          )}
+        >
+          <ExternalLink className="size-4" /> Open ATS
+        </a>
+      ) : (
+        <button
+          type="button"
+          disabled
+          className="inline-flex min-h-11 items-center justify-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm font-medium text-muted opacity-60"
+        >
+          <ExternalLink className="size-4" /> No URL
+        </button>
+      )}
     </div>
   );
 }

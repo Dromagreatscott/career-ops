@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { resolveCli } from "@/lib/clis";
 import { careerOpsRoot, readMemory, doctorState } from "@/lib/career-ops";
+import { logInternalError } from "@/lib/security/errors";
 
 export const runtime = "nodejs"; // child_process (spawn) requires the Node runtime
 export const dynamic = "force-dynamic";
@@ -58,7 +59,7 @@ export async function POST(req: Request) {
 
   const resolved = resolveCli(cliId);
   if (!resolved) {
-    return new Response(JSON.stringify({ error: `CLI '${cliId}' not found on this machine` }), {
+    return new Response(JSON.stringify({ error: "Configured CLI is not available." }), {
       status: 404,
       headers: { "Content-Type": "application/json" },
     });
@@ -180,11 +181,13 @@ export async function POST(req: Request) {
       child.stderr.on("data", (d: Buffer) => {
         const s = d.toString();
         if (/error|not found|denied|fatal/i.test(s)) {
-          safeEnqueue(`\n[${spec.name}] ${s.trim()}\n`);
+          logInternalError("assistant.stderr", new Error(s));
+          safeEnqueue(`\n[${spec.name}] reported a diagnostic\n`);
         }
       });
       child.on("error", (e) => {
-        safeEnqueue(`\n[error launching ${spec.name}: ${e.message}]`);
+        logInternalError("assistant.spawn", e);
+        safeEnqueue(`\n[error launching ${spec.name}]`);
         safeClose();
       });
       child.on("close", () => {

@@ -7,6 +7,7 @@ import type { Job } from "@/lib/command-center/types";
 import { CompanyPriorityBadge } from "./job-card";
 
 export function JobDetail({ job }: { job: Job }) {
+  const applyHref = job.canonicalApplyUrl || job.sourceUrl;
   return (
     <div className="mx-auto max-w-4xl px-5 py-6 max-sm:pb-24 sm:px-6 sm:py-8">
       <Link href="/jobs" className="inline-flex items-center gap-1.5 text-sm text-muted transition hover:text-brand">
@@ -72,20 +73,24 @@ export function JobDetail({ job }: { job: Job }) {
           <section className="rounded-xl border border-border bg-surface/45 p-5">
             <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-muted">Actions</h2>
             <div className="mt-3 grid gap-2">
-              <a
-                href={job.canonicalApplyUrl || job.sourceUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center justify-center gap-2 rounded-md bg-brand px-3 py-2 text-sm font-medium text-brand-foreground transition hover:bg-brand-200"
-              >
-                <ExternalLink className="size-4" /> Open apply page
-              </a>
-              <Link
-                href={`/apply?url=${encodeURIComponent(job.canonicalApplyUrl || job.sourceUrl)}`}
-                className="inline-flex items-center justify-center gap-2 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand"
-              >
-                <ShieldCheck className="size-4" /> Prepare application
-              </Link>
+              {applyHref ? (
+                <>
+                  <a
+                    href={applyHref}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center justify-center gap-2 rounded-md bg-brand px-3 py-2 text-sm font-medium text-brand-foreground transition hover:bg-brand-200"
+                  >
+                    <ExternalLink className="size-4" /> Open apply page
+                  </a>
+                  <Link
+                    href={`/apply?url=${encodeURIComponent(applyHref)}`}
+                    className="inline-flex items-center justify-center gap-2 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand"
+                  >
+                    <ShieldCheck className="size-4" /> Prepare application
+                  </Link>
+                </>
+              ) : null}
               <button className="inline-flex items-center justify-center gap-2 rounded-md border border-border px-3 py-2 text-sm text-muted" disabled>
                 <Send className="size-4" /> Submit requires approval
               </button>

@@ -1,6 +1,7 @@
 import { fillSession, handoffSession, getSession } from "@/lib/apply/session";
 import { resolveTailoredCv, companyFromTitle } from "@/lib/apply/cv";
 import type { ApplyField } from "@/lib/apply/extract";
+import { logInternalError } from "@/lib/security/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -28,7 +29,8 @@ export async function POST(req: Request) {
     const result = await fillSession(sessionId, answers, fields, cvPath);
     if (handoff) await handoffSession(sessionId).catch(() => {});
     return Response.json({ ...result, handedOff: !!handoff, cvAttached: !!cvPath });
-  } catch (e) {
-    return Response.json({ error: e instanceof Error ? e.message.slice(0, 200) : "fill failed" }, { status: 500 });
+  } catch (error) {
+    logInternalError("apply.fill", error, { sessionId });
+    return Response.json({ error: "Could not fill the application form." }, { status: 500 });
   }
 }

@@ -1,4 +1,5 @@
 import type { ApplicationPackage, ApplicationQuestion, AtsType } from "./types";
+import { validateExternalUrl } from "@/lib/security/url";
 
 export type AtsJobRef = {
   atsType: AtsType;
@@ -129,14 +130,11 @@ export const ATS_ADAPTERS: AtsAdapter[] = [GREENHOUSE_ADAPTER, LEVER_ADAPTER];
 
 export function detectAts(rawUrl?: string): AtsJobRef | null {
   if (!rawUrl) return null;
-  try {
-    const url = new URL(rawUrl);
-    for (const adapter of ATS_ADAPTERS) {
-      const ref = adapter.normalize(url);
-      if (ref) return ref;
-    }
-  } catch {
-    return null;
+  const parsed = validateExternalUrl(rawUrl);
+  if (!parsed.ok) return null;
+  for (const adapter of ATS_ADAPTERS) {
+    const ref = adapter.normalize(parsed.parsed);
+    if (ref) return ref;
   }
   return null;
 }

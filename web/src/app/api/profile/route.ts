@@ -3,6 +3,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { careerOpsRoot } from "@/lib/career-ops";
 import { atomicWriteWithBackup } from "@/lib/core/safe-write";
+import { logInternalError } from "@/lib/security/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -83,8 +84,9 @@ export async function POST(req: Request) {
     let parsed: unknown;
     try {
       parsed = yaml.load(fs.readFileSync(file, "utf8"));
-    } catch {
-      return Response.json({ error: "config/profile.yml exists but is not valid YAML — refusing to overwrite it." }, { status: 409 });
+    } catch (error) {
+      logInternalError("profile.parse", error);
+      return Response.json({ error: "Profile configuration is invalid. Fix it before saving changes." }, { status: 409 });
     }
     base = isObj(parsed) ? (parsed as Record<string, unknown>) : {};
   }
@@ -94,8 +96,9 @@ export async function POST(req: Request) {
     // Back up the prior profile before the first normalized write (yaml.dump
     // reformats — comments are not preserved; the .bak is the safety net).
     atomicWriteWithBackup(file, yaml.dump(merged, { lineWidth: 100, noRefs: true }));
-  } catch (e) {
-    return Response.json({ error: e instanceof Error ? e.message : "write failed" }, { status: 500 });
+  } catch (error) {
+    logInternalError("profile.write", error);
+    return Response.json({ error: "Profile could not be saved." }, { status: 500 });
   }
   return Response.json({ ok: true, seeded });
 }

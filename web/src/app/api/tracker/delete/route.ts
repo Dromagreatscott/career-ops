@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { careerOpsRoot, rootScript, trackerCanDelete } from "@/lib/career-ops";
 import { isTrackerWriting } from "@/lib/core/run-registry";
+import { logInternalError } from "@/lib/security/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,11 +17,10 @@ export const dynamic = "force-dynamic";
 // nothing and can overlap.
 let deleting = false;
 
-function parseOrphan(stderr: string): string | null {
+function hasOrphan(stderr: string): boolean {
   // dry-run: "(report file would be orphaned: <path>)"
   // real:    "Note: report file may now be orphaned — <path>"
-  const m = stderr.match(/orphaned[:—-]+\s*([^\n)]+)\)?\s*$/im);
-  return m ? m[1].trim() : null;
+  return /orphaned[:—-]+/im.test(stderr);
 }
 
 export async function POST(req: Request) {
@@ -65,7 +65,7 @@ export async function POST(req: Request) {
       try {
         child = spawn(process.execPath, args, { cwd: careerOpsRoot(), env: process.env });
       } catch (e) {
-        resolve({ code: 1, err: e instanceof Error ? e.message : "failed to start tracker.mjs" });
+        resolve({ code: 1, err: e instanceof Error ? e.message : "failed to start tracker" });
         return;
       }
       child.stderr.on("data", (d: Buffer) => {
@@ -93,12 +93,13 @@ export async function POST(req: Request) {
 
     if (result.code !== 0) {
       const notFound = /No application numbered/i.test(result.err);
+      logInternalError("tracker.delete", new Error(result.err || "delete failed"), { row: num, dryRun });
       return Response.json(
-        { error: result.err.trim().split("\n")[0] || "delete failed" },
+        { error: notFound ? "row not found" : "delete failed" },
         { status: notFound ? 404 : 400 },
       );
     }
-    return Response.json({ ok: true, dryRun, orphanReport: parseOrphan(result.err) });
+    return Response.json({ ok: true, dryRun, orphanReport: hasOrphan(result.err) ? "orphaned-report" : null });
   } finally {
     if (!dryRun) deleting = false;
   }

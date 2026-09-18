@@ -3,6 +3,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { careerOpsRoot } from "@/lib/career-ops";
 import { atomicWriteWithBackup } from "@/lib/core/safe-write";
+import { logInternalError } from "@/lib/security/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -51,8 +52,9 @@ export async function POST(req: Request) {
 
   try {
     atomicWriteWithBackup(file, yaml.dump(doc, { lineWidth: 100, noRefs: true }));
-  } catch (e) {
-    return Response.json({ error: e instanceof Error ? e.message : "write failed" }, { status: 500 });
+  } catch (error) {
+    logInternalError("portals.write", error);
+    return Response.json({ error: "Portals configuration could not be saved." }, { status: 500 });
   }
   return Response.json({ ok: true, roles: roles.length });
 }

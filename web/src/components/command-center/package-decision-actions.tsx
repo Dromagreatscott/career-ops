@@ -7,7 +7,17 @@ import { cn } from "@/lib/cn";
 
 type State = "idle" | "saving" | "done" | "error" | "stale";
 
-export function PackageDecisionActions({ packageId, packageHash, status }: { packageId: string; packageHash: string; status: string }) {
+export function PackageDecisionActions({
+  packageId,
+  packageHash,
+  version,
+  status,
+}: {
+  packageId: string;
+  packageHash: string;
+  version: number;
+  status: string;
+}) {
   const router = useRouter();
   const [state, setState] = useState<State>("idle");
   const decided = status === "APPROVED" || status === "REJECTED";
@@ -18,7 +28,7 @@ export function PackageDecisionActions({ packageId, packageHash, status }: { pac
       const res = await fetch(`/api/applications/packages/${packageId}/decision`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ packageHash, decision }),
+        body: JSON.stringify({ packageHash, version, decision }),
       });
       if (res.status === 409) {
         setState("stale");
@@ -62,7 +72,7 @@ export function PackageDecisionActions({ packageId, packageHash, status }: { pac
           ? "This package changed after the screen loaded. Reload and review the current version before approving."
           : state === "error"
             ? "Decision was not saved. Try again."
-            : "Approval is tied to this exact package hash. External submission is not enabled yet."}
+            : "Approval is tied to this exact package hash and version. External submission is not enabled yet."}
       </div>
     </div>
   );
