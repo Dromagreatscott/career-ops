@@ -3,9 +3,12 @@ import { notFound } from "next/navigation";
 import { AlertTriangle, ArrowLeft, CheckCircle2, ExternalLink, FileText, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { commandCenterData, findCommandCenterPackage } from "@/lib/command-center/service";
-import type { ApplicationPackage, QuestionClassification, VerificationState } from "@/lib/command-center/types";
+import { readApplicationSessions } from "@/lib/command-center/application-sessions";
+import { validateExecutionUrlSyncForTest } from "@/lib/command-center/executor-url";
+import type { ApplicationPackage, ApplicationSession, QuestionClassification, VerificationState } from "@/lib/command-center/types";
 import { PackageDecisionActions } from "@/components/command-center/package-decision-actions";
 import { ResumeOverrideActions } from "@/components/command-center/resume-override-actions";
+import { PackageExecutionActions } from "@/components/command-center/package-execution-actions";
 
 export const dynamic = "force-dynamic";
 
@@ -19,6 +22,11 @@ export default async function ApplicationReviewPage({ params }: { params: Promis
   const completeQuestions = applicationPackage.questions.filter((question) => question.classification !== "USER_REQUIRED").length;
   const warnings = warningsForPackage(applicationPackage);
   const verifiedProfileItems = profile.verification.filter((item) => item.status === "verified").length;
+  const sessions = readApplicationSessions()
+    .filter((session) => session.applicationPackageId === applicationPackage.id)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const latestSession = sessions[0];
+  const readiness = executionReadiness(applicationPackage);
 
   return (
     <div className="mx-auto max-w-5xl px-5 py-6 max-sm:pb-24 sm:px-6 sm:py-8">
@@ -166,6 +174,24 @@ export default async function ApplicationReviewPage({ params }: { params: Promis
           </section>
 
           <section className="rounded-xl border border-border bg-surface/45 p-5">
+            <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-muted">Execution Readiness</h2>
+            <div className="mt-4 space-y-3 text-sm">
+              <CheckLine label="ATS" value={readiness.ats} complete={readiness.ats === "SUPPORTED"} />
+              <CheckLine label="Application URL" value={readiness.url} complete={readiness.url === "VALID"} />
+              <CheckLine label="Resume" value={readiness.resume} complete={readiness.resume === "READY"} />
+              <CheckLine label="Profile" value={readiness.profile} complete={readiness.profile === "READY"} />
+              <CheckLine label="Answers" value={readiness.answers} complete={readiness.answers === "AUTO-FILL READY"} />
+              <CheckLine label="Package" value="CURRENT" complete />
+              <CheckLine label="Approval" value={readiness.approval} complete={readiness.approval === "VALID"} />
+            </div>
+            {readiness.warnings.length ? (
+              <div className="mt-4 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-800 dark:text-amber-300">
+                {readiness.warnings.map((warning) => <p key={warning}>{warning}</p>)}
+              </div>
+            ) : null}
+          </section>
+
+          <section className="rounded-xl border border-border bg-surface/45 p-5">
             <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-muted">Profile Verification</h2>
             <div className="mt-3 space-y-2">
               {profile.verification.map((item) => (
@@ -197,8 +223,18 @@ export default async function ApplicationReviewPage({ params }: { params: Promis
             <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-muted">Submit Executor</h2>
             <div className="mt-3 flex items-start gap-2 rounded-md bg-background/45 p-3 text-sm text-muted">
               <ShieldCheck className="mt-0.5 size-4 shrink-0 text-brand" />
-              Greenhouse/Lever detection is scaffolded. External autofill and submission are disabled in this slice.
+              Greenhouse/Lever execution is package-gated. Dry run stops before final submit.
             </div>
+            <div className="mt-4">
+              <PackageExecutionActions
+                packageId={applicationPackage.id}
+                packageHash={applicationPackage.packageHash}
+                version={applicationPackage.version}
+                canSubmit={readiness.readyForLive}
+                resumableSessionId={latestSession?.status === "USER_INTERVENTION_REQUIRED" ? latestSession.id : undefined}
+              />
+            </div>
+            {latestSession ? <ExecutionSessionSummary session={latestSession} /> : null}
           </section>
         </aside>
       </div>
@@ -245,6 +281,66 @@ function warningsForPackage(pkg: ApplicationPackage): string[] {
     pkg.selectedResume.status !== "ready" ? "Selected resume file is pending." : "",
     pkg.questions.some((question) => question.classification === "USER_REQUIRED") ? "At least one answer needs David before submission." : "",
   ].filter(Boolean);
+}
+
+function executionReadiness(pkg: ApplicationPackage) {
+  const url = validateExecutionUrlSyncForTest(pkg.canonicalApplyUrl ?? pkg.canonicalJobUrl);
+  const supported = pkg.atsType === "greenhouse" || pkg.atsType === "lever";
+  const userRequired = pkg.questions.filter((question) => question.classification === "USER_REQUIRED");
+  const reviewRequired = pkg.questions.filter((question) => question.classification === "REVIEW_REQUIRED");
+  const approvalValid = pkg.status === "APPROVED" && pkg.approval?.status === "approved" && pkg.approval.packageHash === pkg.packageHash;
+  const warnings = [
+    supported ? "" : "Unsupported ATS. Use manual mode or wait for a supported adapter.",
+    url.ok ? "" : "Application URL is not safe or valid for browser execution.",
+    pkg.selectedResume.status === "ready" ? "" : "Selected resume is not ready.",
+    userRequired.length ? `${userRequired.length} field(s) still need David.` : "",
+    reviewRequired.some((question) => !question.value && question.draft) ? "Review-required drafts should be approved before live submission." : "",
+    approvalValid ? "" : "Exact package approval is required for live execution.",
+  ].filter(Boolean);
+  return {
+    ats: supported ? "SUPPORTED" : "UNSUPPORTED",
+    url: url.ok ? "VALID" : "INVALID",
+    resume: pkg.selectedResume.status === "ready" ? "READY" : "MISSING",
+    profile: pkg.profileSnapshot ? "READY" : "INCOMPLETE",
+    answers: userRequired.length ? "NEEDS YOU" : reviewRequired.length ? "NEEDS REVIEW" : "AUTO-FILL READY",
+    approval: approvalValid ? "VALID" : "REQUIRED",
+    warnings,
+    readyForLive: supported && url.ok && pkg.selectedResume.status === "ready" && !userRequired.length && approvalValid,
+  };
+}
+
+function ExecutionSessionSummary({ session }: { session: ApplicationSession }) {
+  const needsDavid = session.status === "USER_INTERVENTION_REQUIRED";
+  return (
+    <div className="mt-4 rounded-md bg-background/45 p-3 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="font-medium text-foreground">{session.mode === "DRY_RUN" ? "Dry run" : "Live session"}</span>
+        <Badge tone={needsDavid ? "warn" : session.status === "SUBMITTED" ? "good" : session.status === "FAILED" ? "bad" : "muted"}>
+          {session.status === "USER_INTERVENTION_REQUIRED" ? "NEEDS DAVID" : formatStatus(session.status)}
+        </Badge>
+      </div>
+      {needsDavid ? (
+        <p className="mt-2 text-xs leading-relaxed text-amber-800 dark:text-amber-300">{session.userActionMessage || session.lastErrorCode}</p>
+      ) : null}
+      {session.status === "SUBMITTED" ? (
+        <div className="mt-2 space-y-1 text-xs text-muted">
+          <p>{session.submittedAt}</p>
+          {session.confirmationId ? <p>Confirmation: {session.confirmationId}</p> : null}
+          {session.confirmationSummary ? <p>{session.confirmationSummary}</p> : null}
+          {session.confirmationUrl ? <a href={session.confirmationUrl} target="_blank" rel="noreferrer" className="text-brand hover:underline">Open confirmation</a> : null}
+        </div>
+      ) : null}
+      {session.dryRunReport ? (
+        <div className="mt-3 grid gap-1 text-xs text-muted">
+          <p>Fields found: {session.dryRunReport.fieldsFound}</p>
+          <p>Safe autofill: {session.dryRunReport.safeAutofill.length}</p>
+          <p>Needs review: {session.dryRunReport.reviewRequired.length}</p>
+          <p>Needs you: {session.dryRunReport.userRequired.length}</p>
+          <p>Ready for live: {session.dryRunReport.readyForLiveSubmission ? "yes" : "no"}</p>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 function formatStatus(value: string): string {

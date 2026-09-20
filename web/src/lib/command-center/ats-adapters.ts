@@ -53,11 +53,15 @@ export interface AtsAdapter {
 
 const SAFE_SLUG = /^[a-zA-Z0-9._-]+$/;
 
+function hostMatches(host: string, allowed: string[]): boolean {
+  return allowed.some((item) => host === item || host.endsWith(`.${item}`));
+}
+
 function reviewOnlyAdapter(type: "greenhouse" | "lever", hosts: string[], pathPattern: RegExp): AtsAdapter {
   return {
     type,
     detect(url) {
-      return hosts.includes(url.hostname) && pathPattern.test(url.pathname);
+      return hostMatches(url.hostname.toLowerCase(), hosts) && pathPattern.test(url.pathname);
     },
     normalize(url) {
       const match = url.pathname.match(pathPattern);
@@ -117,7 +121,7 @@ function reviewOnlyAdapter(type: "greenhouse" | "lever", hosts: string[], pathPa
 export const GREENHOUSE_ADAPTER = reviewOnlyAdapter(
   "greenhouse",
   ["boards.greenhouse.io", "job-boards.greenhouse.io", "greenhouse.io"],
-  /^\/([^/]+)\/jobs\/([a-zA-Z0-9._-]+)/,
+  /^\/([^/]+)\/jobs?\/([a-zA-Z0-9._-]+)/,
 );
 
 export const LEVER_ADAPTER = reviewOnlyAdapter(

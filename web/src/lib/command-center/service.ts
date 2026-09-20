@@ -706,12 +706,13 @@ export function commandCenterData(): CommandCenterData {
       APPROVED: 3,
       SUBMITTING: 4,
       SUBMITTED: 5,
-      INTERVIEW: 6,
-      QUALIFIED: 7,
-      EVALUATING: 8,
-      DISCOVERED: 9,
-      REJECTED: 10,
-      CLOSED: 11,
+      FAILED: 6,
+      INTERVIEW: 7,
+      QUALIFIED: 8,
+      EVALUATING: 9,
+      DISCOVERED: 10,
+      REJECTED: 11,
+      CLOSED: 12,
     };
     return order[a.status] - order[b.status] || a.company.localeCompare(b.company);
   });

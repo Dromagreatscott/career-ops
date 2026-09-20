@@ -59,12 +59,13 @@ const BASELINE_TRANSITIONS: Record<ApplicationPackageStatus, ApplicationPackageS
   PREPARING: ["READY_FOR_REVIEW", "USER_INTERVENTION_REQUIRED"],
   READY_FOR_REVIEW: ["APPROVED", "REJECTED"],
   APPROVED: ["SUBMITTING"],
-  SUBMITTING: ["SUBMITTED", "USER_INTERVENTION_REQUIRED"],
+  SUBMITTING: ["SUBMITTED", "USER_INTERVENTION_REQUIRED", "FAILED"],
   SUBMITTED: [],
-  USER_INTERVENTION_REQUIRED: ["PREPARING", "SUBMITTING"],
+  USER_INTERVENTION_REQUIRED: ["PREPARING", "SUBMITTING", "FAILED"],
   INTERVIEW: [],
   CLOSED: [],
   REJECTED: [],
+  FAILED: ["SUBMITTING", "USER_INTERVENTION_REQUIRED"],
 };
 
 function packageDir(): string {
@@ -675,6 +676,34 @@ export function decideApplicationPackage(
     updatedAt: nowIso(),
   };
   return { ok: true, package: writeApplicationPackage(updated) };
+}
+
+export function setApplicationPackageExecutionStatus(
+  id: string,
+  packageHash: string,
+  expectedVersion: number,
+  status: Extract<ApplicationPackageStatus, "SUBMITTING" | "SUBMITTED" | "USER_INTERVENTION_REQUIRED" | "FAILED">,
+): { ok: true; package: ApplicationPackage } | { ok: false; status: number; error: string } {
+  const read = readApplicationPackage(id);
+  if (!read.ok) return { ok: false, status: read.status, error: read.error };
+  const existing = read.package;
+  const actualHash = recomputePackageHash(existing);
+  if (existing.packageHash !== packageHash || actualHash !== packageHash) {
+    return { ok: false, status: 409, error: "package changed after execution started" };
+  }
+  if (existing.version !== expectedVersion) {
+    return { ok: false, status: 409, error: "package version changed after execution started" };
+  }
+  const transitionError = assertPackageStatusTransition(existing.status, status);
+  if (transitionError) return { ok: false, status: transitionError.status, error: transitionError.error };
+  return {
+    ok: true,
+    package: writeApplicationPackage({
+      ...existing,
+      status,
+      updatedAt: nowIso(),
+    }),
+  };
 }
 
 export function packageStatusLabel(status: ApplicationPackageStatus): string {

@@ -98,9 +98,113 @@ export type ApplicationPackageStatus =
   | "USER_INTERVENTION_REQUIRED"
   | "INTERVIEW"
   | "CLOSED"
-  | "REJECTED";
+  | "REJECTED"
+  | "FAILED";
 
 export type AtsType = "greenhouse" | "lever" | "ashby" | "workday" | "unknown";
+
+export type ApplicationSessionMode = "DRY_RUN" | "LIVE";
+
+export type ApplicationSessionStatus =
+  | "SUBMITTING"
+  | "DRY_RUN_COMPLETE"
+  | "USER_INTERVENTION_REQUIRED"
+  | "SUBMITTED"
+  | "FAILED";
+
+export type ApplicationAccountState =
+  | "NO_ACCOUNT_REQUIRED"
+  | "ACCOUNT_REQUIRED"
+  | "ACCOUNT_EXISTS_AUTHENTICATED"
+  | "ACCOUNT_EXISTS_LOGIN_REQUIRED"
+  | "ACCOUNT_CREATION_REQUIRED"
+  | "EMAIL_VERIFICATION_REQUIRED"
+  | "MFA_REQUIRED"
+  | "CAPTCHA_REQUIRED"
+  | "USER_INTERVENTION_REQUIRED"
+  | "APPLICATION_READY";
+
+export type ApplicationBlockerCode =
+  | "CAPTCHA_REQUIRED"
+  | "MFA_REQUIRED"
+  | "LOGIN_REQUIRED"
+  | "ACCOUNT_CREATION_REQUIRED"
+  | "EMAIL_VERIFICATION_REQUIRED"
+  | "UNKNOWN_REQUIRED_FIELD"
+  | "USER_REQUIRED_FIELD"
+  | "UNSUPPORTED_WIDGET"
+  | "UNEXPECTED_ATS_STRUCTURE"
+  | "RESUME_VERSION_MISMATCH"
+  | "STALE_APPROVAL"
+  | "NETWORK_FAILURE"
+  | "CONFIRMATION_UNVERIFIED"
+  | "UNSUPPORTED_ATS"
+  | "BAD_APPLICATION_URL"
+  | "DUPLICATE_SUBMISSION"
+  | "MISSING_RESUME";
+
+export type ApplicationSessionAuditEvent = {
+  timestamp: string;
+  type:
+    | "SESSION_CREATED"
+    | "ATS_DETECTED"
+    | "FORM_INSPECTED"
+    | "FIELD_MAPPED"
+    | "FIELD_FILLED"
+    | "RESUME_UPLOADED"
+    | "VALIDATION_COMPLETED"
+    | "VALIDATION_FAILED"
+    | "DRY_RUN_COMPLETED"
+    | "USER_INTERVENTION_REQUIRED"
+    | "EXECUTION_RESUMED"
+    | "SUBMISSION_ATTEMPTED"
+    | "CONFIRMATION_OBSERVED"
+    | "SUBMITTED"
+    | "FAILED";
+  summary: string;
+  fieldId?: string;
+  status?: string;
+};
+
+export type ApplicationSession = {
+  id: string;
+  userId: string;
+  profileScope: string;
+  applicationPackageId: string;
+  applicationPackageVersion: number;
+  applicationPackageHash: string;
+  atsType: AtsType;
+  applicationUrl: string;
+  canonicalUrl: string;
+  mode: ApplicationSessionMode;
+  status: ApplicationSessionStatus;
+  createdAt: string;
+  updatedAt: string;
+  lastStep?: string;
+  lastErrorCode?: ApplicationBlockerCode;
+  requiresUserAction: boolean;
+  userActionMessage?: string;
+  accountState: ApplicationAccountState;
+  confirmationId?: string;
+  confirmationUrl?: string;
+  confirmationSummary?: string;
+  submittedAt?: string;
+  dryRunReport?: ApplicationDryRunReport;
+  auditEvents: ApplicationSessionAuditEvent[];
+};
+
+export type ApplicationDryRunReport = {
+  ats: AtsType;
+  fieldsFound: number;
+  safeAutofill: string[];
+  reviewRequired: string[];
+  userRequired: string[];
+  unknownRequired: string[];
+  resume: "READY" | "MISSING" | "VERSION_MISMATCH";
+  validation: "READY" | "BLOCKED" | "FAILED";
+  readyForLiveSubmission: boolean;
+  blockers: Array<{ code: ApplicationBlockerCode; message: string; action: string }>;
+};
 
 export type CompensationStatus = "preferred" | "eligible_unknown" | "comp_exception_low_priority" | "unknown";
 
