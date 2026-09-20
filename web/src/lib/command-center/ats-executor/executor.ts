@@ -147,7 +147,7 @@ async function runSession(pkg: ApplicationPackage, session: ApplicationSession, 
   const reread = readApplicationPackage(pkg.id);
   if (!reread.ok) return { ok: false, status: reread.status, error: reread.error };
   const approvalError = assertExactApproval(reread.package, pkg.packageHash, pkg.version, ["APPROVED", "SUBMITTING"]);
-  if (approvalError) {
+  if (approvalError && !approvalError.ok) {
     const blocker = { code: "STALE_APPROVAL" as const, message: approvalError.error, action: "Rebuild, review, and approve the current package." };
     const staleReport = dryRunReport(adapter.type, mappings, "READY", [blocker]);
     setApplicationPackageExecutionStatus(pkg.id, pkg.packageHash, pkg.version, "USER_INTERVENTION_REQUIRED");
