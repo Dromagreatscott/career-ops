@@ -28,6 +28,7 @@ function useRoot() {
 }
 
 function profile() {
+  const resumePath = "data/David_Scott_AI_Resume_2026_v4_4_MASTER_ATS.pdf";
   return {
     contact: {},
     employmentHistory: [],
@@ -35,7 +36,20 @@ function profile() {
     portfolio: [],
     preferredRoles: [],
     standardAnswers: { work_authorization: "Yes", onsite_availability: "Remote" },
+    reusableAnswers: [],
+    verification: [],
     resumeVariants: [],
+    resumeLibrary: [
+      {
+        id: "resume-master-ats",
+        label: "David Scott Applied AI Resume",
+        path: resumePath,
+        format: "pdf",
+        status: fs.existsSync(path.join(process.env.CAREER_OPS_ROOT ?? "", resumePath)) ? "ready" : "missing",
+        isDefault: true,
+        recommendedFor: ["Applied AI", "AI architecture"],
+      },
+    ],
     dreamCompanies: [],
     excludedRoleTypes: [],
   };
@@ -137,6 +151,39 @@ test("valid approval succeeds", () => {
   assert.equal(result.package.approval.packageHash, pkg.packageHash);
 });
 
+test("application package records recommended resume metadata", () => {
+  const root = useRoot();
+  fs.writeFileSync(path.join(root, "data", "David_Scott_AI_Resume_2026_v4_4_MASTER_ATS.pdf"), "pdf", "utf8");
+  const pkg = packages.buildApplicationPackage(job(), profile());
+  assert.equal(pkg.selectedResume.id, "resume-master-ats");
+  assert.equal(pkg.selectedResume.status, "ready");
+  assert.equal(pkg.selectedResume.selection, "recommended");
+  assert.match(pkg.selectedResume.recommendationReason, /Recommended/);
+});
+
+test("resume override changes package hash and increments version", () => {
+  const root = useRoot();
+  fs.writeFileSync(path.join(root, "data", "David_Scott_AI_Resume_2026_v4_4_MASTER_ATS.pdf"), "pdf", "utf8");
+  fs.writeFileSync(path.join(root, "data", "leadership_resume.pdf"), "pdf", "utf8");
+  const profileData = profile();
+  profileData.resumeLibrary.push({
+    id: "resume-leadership",
+    label: "Leadership Resume",
+    path: "data/leadership_resume.pdf",
+    format: "pdf",
+    status: "ready",
+    isDefault: false,
+    recommendedFor: ["Director", "Head of AI"],
+  });
+  const first = packages.prepareApplicationPackage(job(), profileData);
+  const result = packages.overrideApplicationPackageResume(first.id, first.packageHash, first.version, "resume-leadership", profileData, job());
+  assert.equal(result.ok, true);
+  assert.equal(result.package.selectedResume.id, "resume-leadership");
+  assert.equal(result.package.selectedResume.selection, "override");
+  assert.equal(result.package.version, first.version + 1);
+  assert.notEqual(result.package.packageHash, first.packageHash);
+});
+
 test("package mutation invalidates approval and increments version", () => {
   useRoot();
   const first = packages.prepareApplicationPackage(job(), profile());
@@ -170,7 +217,7 @@ test("unsupported but valid ATS URL is handled honestly", () => {
   assert.equal(pkg.canonicalApplyUrl, "https://jobs.example.org/postings/123");
 });
 
-test("raw internal-looking values are not echoed by status errors", async () => {
+test("anonymous status updates are denied without echoing raw internal-looking values", async () => {
   useRoot();
   const secret = "/root/very-sensitive/path";
   const req = new Request("http://localhost/api/status", {
@@ -180,6 +227,6 @@ test("raw internal-looking values are not echoed by status errors", async () => 
   });
   const res = await statusRoute.POST(req);
   const body = await res.json();
-  assert.equal(res.status, 400);
+  assert.equal(res.status, 401);
   assert.equal(String(body.error).includes(secret), false);
 });

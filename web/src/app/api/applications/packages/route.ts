@@ -1,3 +1,4 @@
+import { requireAuth, requireSameOrigin } from "@/lib/auth/guards";
 import { NextRequest } from "next/server";
 import { prepareApplicationPackage } from "@/lib/command-center/application-packages";
 import { commandCenterData } from "@/lib/command-center/service";
@@ -7,6 +8,11 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
+  const auth = await requireAuth();
+  if (!auth.ok) return auth.response;
+  const origin = requireSameOrigin(req);
+  if (!origin.ok) return origin.response;
+
   let body: { jobId?: string };
   try {
     body = (await req.json()) as { jobId?: string };

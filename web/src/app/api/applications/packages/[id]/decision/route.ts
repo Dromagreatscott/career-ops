@@ -1,3 +1,4 @@
+import { requireAuth, requireSameOrigin } from "@/lib/auth/guards";
 import { NextRequest } from "next/server";
 import { decideApplicationPackage } from "@/lib/command-center/application-packages";
 
@@ -5,6 +6,11 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const auth = await requireAuth();
+  if (!auth.ok) return auth.response;
+  const origin = requireSameOrigin(req);
+  if (!origin.ok) return origin.response;
+
   const { id } = await params;
   let body: { packageHash?: string; version?: number; decision?: "approved" | "rejected" };
   try {

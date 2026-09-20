@@ -106,6 +106,93 @@ export type CompensationStatus = "preferred" | "eligible_unknown" | "comp_except
 
 export type QuestionClassification = "SAFE_AUTOFILL" | "REVIEW_REQUIRED" | "USER_REQUIRED";
 
+export type VerificationState = "verified" | "needs_review" | "missing";
+
+export type ProfileField<T = string> = {
+  value: T;
+  verificationState: VerificationState;
+  updatedAt?: string;
+};
+
+export type ProfileVerificationItem = {
+  id: string;
+  label: string;
+  status: VerificationState;
+  source: string;
+  detail?: string;
+  updatedAt?: string;
+};
+
+export type ReusableApplicationAnswer = {
+  id: string;
+  userId?: string;
+  profileScope?: string;
+  scope?: "universal" | "company" | "role";
+  company?: string;
+  answerType?: string;
+  label: string;
+  title?: string;
+  value: string;
+  content?: string;
+  category: "authorization" | "location" | "compensation" | "logistics" | "narrative";
+  verification: VerificationState;
+  verificationState?: VerificationState;
+  classification?: QuestionClassification;
+  safeToAutofill: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+  lastReviewedAt?: string;
+  isArchived?: boolean;
+};
+
+export type ResumeLibraryItem = {
+  id: string;
+  userId?: string;
+  profileScope?: string;
+  label: string;
+  name?: string;
+  category?: string;
+  version?: number;
+  originalFilename?: string;
+  path: string;
+  storageRef?: string;
+  format: "pdf" | "docx" | "html" | "md" | "txt" | "other";
+  status: "ready" | "missing";
+  isDefault: boolean;
+  isArchived?: boolean;
+  recommendedFor: string[];
+  notes?: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type CompanyAnswerPackEntry = {
+  id: string;
+  answerType: string;
+  title: string;
+  content: string;
+  length?: "short" | "medium" | "long";
+  useCase?: string;
+  classification: QuestionClassification;
+  verificationState: VerificationState;
+  createdAt: string;
+  updatedAt: string;
+  lastReviewedAt?: string;
+  isArchived?: boolean;
+};
+
+export type CompanyAnswerPack = {
+  id: string;
+  userId: string;
+  profileScope: string;
+  company: string;
+  aliases: string[];
+  entries: CompanyAnswerPackEntry[];
+  createdAt: string;
+  updatedAt: string;
+  isArchived?: boolean;
+};
+
 export type ApplicationQuestion = {
   id: string;
   label: string;
@@ -135,9 +222,39 @@ export type ApplicationPackage = {
   compensationStatus: CompensationStatus;
   roleFitExplanation: string[];
   selectedResume: {
+    id?: string;
     label: string;
     path?: string;
     status: "ready" | "pending";
+    version?: number;
+    selection?: "recommended" | "override";
+    recommendationReason?: string;
+    overrideReason?: string;
+  };
+  userId?: string;
+  profileScope?: string;
+  profileSnapshot?: {
+    version: number;
+    hash: string;
+    reference: string;
+  };
+  reusableAnswerRefs?: Array<{
+    id: string;
+    version?: number;
+    classification: QuestionClassification;
+    hash: string;
+  }>;
+  companyAnswerRefs?: Array<{
+    packId: string;
+    entryId: string;
+    classification: QuestionClassification;
+    hash: string;
+  }>;
+  packageIssues?: {
+    missingFields: string[];
+    reviewRequiredFields: string[];
+    userRequiredFields: string[];
+    warnings: string[];
   };
   tailoredResumeChanges: string[];
   coverLetter: {
@@ -201,6 +318,10 @@ export type EducationItem = {
 };
 
 export type ProfileView = {
+  userId?: string;
+  profileScope?: string;
+  version?: number;
+  snapshotHash?: string;
   contact: {
     fullName?: string;
     email?: string;
@@ -217,7 +338,11 @@ export type ProfileView = {
   salaryTarget?: string;
   geographicPreferences?: string;
   standardAnswers: Record<string, string>;
+  reusableAnswers: ReusableApplicationAnswer[];
+  verification: ProfileVerificationItem[];
   resumeVariants: string[];
+  resumeLibrary: ResumeLibraryItem[];
+  companyAnswerPacks?: CompanyAnswerPack[];
   dreamCompanies: CompanyPriority[];
   excludedRoleTypes: string[];
 };

@@ -5,8 +5,27 @@ import { careerOpsRoot, readApplications } from "@/lib/career-ops";
 import { normalizeExternalUrl } from "@/lib/security/url";
 import { companyPrioritiesFromProfile, companyPriorityFor } from "./company-priority";
 import { findApplicationPackage, readApplicationPackages } from "./application-packages";
+import { readCompanyAnswerPacks, readReusableAnswers } from "./answer-library";
 import { canonicalApplyUrl, plainSummary, scoreValue, sourcePlatform, stableId, stageFromEvaluation, stageFromStatus, workArrangementFromText } from "./normalize";
-import type { Application, ApplicationPackage, Approval, AuditEvent, CommandCenterData, EducationItem, EmploymentHistoryItem, Evaluation, Job, Outreach, ProfileView } from "./types";
+import { profileHash, readProfileRecord } from "./profile-store";
+import { readResumeLibrary } from "./resume-library";
+import type {
+  Application,
+  ApplicationPackage,
+  Approval,
+  AuditEvent,
+  CommandCenterData,
+  EducationItem,
+  EmploymentHistoryItem,
+  Evaluation,
+  Job,
+  Outreach,
+  ProfileVerificationItem,
+  ProfileView,
+  ReusableApplicationAnswer,
+  ResumeLibraryItem,
+  VerificationState,
+} from "./types";
 
 function readText(rel: string): string | null {
   try {
@@ -41,6 +60,19 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function asStringList(value: unknown): string[] {
   return Array.isArray(value) ? value.map(String).map((s) => s.trim()).filter(Boolean) : [];
+}
+
+function verificationFor(value: string | undefined, needsReview = false): VerificationState {
+  if (!value?.trim()) return "missing";
+  return needsReview ? "needs_review" : "verified";
+}
+
+function fileUpdatedAt(rel: string): string | undefined {
+  try {
+    return fs.statSync(path.join(careerOpsRoot(), rel)).mtime.toISOString();
+  } catch {
+    return undefined;
+  }
 }
 
 function sectionFromMarkdown(md: string | null, heading: string): string {
@@ -111,6 +143,154 @@ function parsePortfolio(profile: Record<string, unknown> | null, cv: string | nu
   const portfolioSection = sectionFromMarkdown(cv, "Industries & Portfolio");
   const urls = portfolioSection.match(/https?:\/\/[^\s)]+|(?:[\w-]+\.)+[a-z]{2,}(?:\/[^\s)]*)?/gi) ?? [];
   return [...new Set([...configured, ...urls.map((url) => url.replace(/[.,;]+$/, ""))])];
+}
+
+function resumeFormat(rel: string): ResumeLibraryItem["format"] {
+  const ext = path.extname(rel).toLowerCase();
+  if (ext === ".pdf") return "pdf";
+  if (ext === ".docx") return "docx";
+  if (ext === ".html" || ext === ".htm") return "html";
+  if (ext === ".md") return "md";
+  if (ext === ".txt") return "txt";
+  return "other";
+}
+
+function resumeLabel(rel: string): string {
+  if (rel === "cv.md") return "Canonical Career Ops CV";
+  return path.basename(rel, path.extname(rel)).replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function resumeLibrary(): ResumeLibraryItem[] {
+  const persisted = readResumeLibrary("career-ops-operator", "career-ops");
+  if (persisted.length) return persisted;
+  const candidates = new Set<string>(["data/David_Scott_AI_Resume_2026_v4_4_MASTER_ATS.pdf", "cv.md"]);
+  try {
+    for (const entry of fs.readdirSync(path.join(careerOpsRoot(), "data"), { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      if (!/\.(pdf|docx|html?|md|txt)$/i.test(entry.name)) continue;
+      if (!/(resume|cv)/i.test(entry.name)) continue;
+      candidates.add(`data/${entry.name}`);
+    }
+  } catch {
+    /* data directory is optional in tests */
+  }
+
+  return [...candidates].map((rel) => {
+    const absolute = path.join(careerOpsRoot(), rel);
+    const exists = fs.existsSync(absolute);
+    const isDefault = /MASTER_ATS\.pdf$/i.test(rel);
+    return {
+      id: stableId("resume", rel),
+      label: isDefault ? "David Scott Applied AI Resume" : resumeLabel(rel),
+      path: rel,
+      format: resumeFormat(rel),
+      status: exists ? "ready" as const : "missing" as const,
+      isDefault,
+      recommendedFor: isDefault
+        ? ["Applied AI", "AI architecture", "AI transformation", "agentic operations"]
+        : ["Profile source", "manual review"],
+      notes: isDefault ? "Default ATS-ready resume for application packages." : undefined,
+      updatedAt: exists ? fileUpdatedAt(rel) : undefined,
+    };
+  }).sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || a.label.localeCompare(b.label));
+}
+
+function reusableAnswers(standardAnswers: Record<string, string>, profile: Record<string, unknown> | null): ReusableApplicationAnswer[] {
+  const persisted = readReusableAnswers("career-ops-operator", "career-ops");
+  if (persisted.length) return persisted;
+  const compensation = asRecord(profile?.compensation);
+  const coverLetter = asRecord(profile?.cover_letter);
+  const answers: ReusableApplicationAnswer[] = [
+    {
+      id: "work_authorization",
+      label: "US work authorization",
+      value: standardAnswers.work_authorization ?? "",
+      category: "authorization",
+      verification: verificationFor(standardAnswers.work_authorization),
+      safeToAutofill: Boolean(standardAnswers.work_authorization?.trim()),
+    },
+    {
+      id: "onsite_availability",
+      label: "Location and onsite availability",
+      value: standardAnswers.onsite_availability ?? "",
+      category: "location",
+      verification: verificationFor(standardAnswers.onsite_availability, true),
+      safeToAutofill: false,
+    },
+    {
+      id: "notice_period",
+      label: "Notice period",
+      value: standardAnswers.notice_period ? `${standardAnswers.notice_period} days` : "",
+      category: "logistics",
+      verification: verificationFor(standardAnswers.notice_period),
+      safeToAutofill: Boolean(standardAnswers.notice_period?.trim()),
+    },
+    {
+      id: "salary_policy",
+      label: "Compensation policy",
+      value: String(compensation.target_range ?? compensation.target_floor ?? ""),
+      category: "compensation",
+      verification: verificationFor(String(compensation.target_range ?? ""), true),
+      safeToAutofill: false,
+    },
+    {
+      id: "primary_domain",
+      label: "Primary domain",
+      value: String(coverLetter.primary_domain ?? ""),
+      category: "narrative",
+      verification: verificationFor(String(coverLetter.primary_domain ?? ""), true),
+      safeToAutofill: false,
+    },
+  ];
+  return answers;
+}
+
+function profileVerification(
+  contact: ProfileView["contact"],
+  answers: ReusableApplicationAnswer[],
+  resumes: ResumeLibraryItem[],
+): ProfileVerificationItem[] {
+  return [
+    {
+      id: "contact",
+      label: "Contact information",
+      status: verificationFor([contact.fullName, contact.email, contact.phone, contact.location].filter(Boolean).join(" ")),
+      source: "config/profile.yml",
+      detail: "Name, email, phone, and location are present.",
+      updatedAt: fileUpdatedAt("config/profile.yml"),
+    },
+    {
+      id: "work_authorization",
+      label: "Work authorization",
+      status: answers.find((answer) => answer.id === "work_authorization")?.verification ?? "missing",
+      source: "config/profile.yml",
+      detail: "Used for safe autofill when present.",
+      updatedAt: fileUpdatedAt("config/profile.yml"),
+    },
+    {
+      id: "location",
+      label: "Location constraints",
+      status: answers.find((answer) => answer.id === "onsite_availability")?.verification ?? "missing",
+      source: "config/profile.yml",
+      detail: "Always reviewed against each role before submission.",
+      updatedAt: fileUpdatedAt("config/profile.yml"),
+    },
+    {
+      id: "compensation",
+      label: "Compensation guidance",
+      status: answers.find((answer) => answer.id === "salary_policy")?.verification ?? "missing",
+      source: "config/profile.yml",
+      detail: "Never autofilled without David.",
+      updatedAt: fileUpdatedAt("config/profile.yml"),
+    },
+    {
+      id: "resume_library",
+      label: "Resume library",
+      status: resumes.some((resume) => resume.status === "ready") ? "verified" : "missing",
+      source: "data/",
+      detail: `${resumes.filter((resume) => resume.status === "ready").length} ready resume source(s).`,
+    },
+  ];
 }
 
 type PipelineEntry = {
@@ -334,6 +514,7 @@ function mergeJobs(): Job[] {
 }
 
 function profileView(profile: Record<string, unknown> | null): ProfileView {
+  const persistedProfile = readProfileRecord("career-ops-operator", "career-ops");
   const candidate = asRecord(profile?.candidate);
   const targetRoles = asRecord(profile?.target_roles);
   const compensation = asRecord(profile?.compensation);
@@ -344,16 +525,23 @@ function profileView(profile: Record<string, unknown> | null): ProfileView {
     onsite_availability: String(location.onsite_availability ?? ""),
     notice_period: String(asRecord(profile?.cover_letter).notice_period_days ?? ""),
   };
+  const contact = {
+    fullName: String(candidate.full_name ?? ""),
+    email: String(candidate.email ?? ""),
+    phone: String(candidate.phone ?? ""),
+    location: String(candidate.location ?? location.city ?? ""),
+    linkedin: String(candidate.linkedin ?? ""),
+    portfolioUrl: String(candidate.portfolio_url ?? ""),
+    github: String(candidate.github ?? ""),
+  };
+  const resumes = resumeLibrary();
+  const reusable = reusableAnswers(standardAnswers, profile);
   return {
-    contact: {
-      fullName: String(candidate.full_name ?? ""),
-      email: String(candidate.email ?? ""),
-      phone: String(candidate.phone ?? ""),
-      location: String(candidate.location ?? location.city ?? ""),
-      linkedin: String(candidate.linkedin ?? ""),
-      portfolioUrl: String(candidate.portfolio_url ?? ""),
-      github: String(candidate.github ?? ""),
-    },
+    userId: persistedProfile.userId,
+    profileScope: persistedProfile.profileScope,
+    version: persistedProfile.version,
+    snapshotHash: profileHash(persistedProfile),
+    contact,
     employmentHistory: parseEmploymentHistory(cv),
     education: parseEducation(cv),
     portfolio: parsePortfolio(profile, cv),
@@ -361,7 +549,11 @@ function profileView(profile: Record<string, unknown> | null): ProfileView {
     salaryTarget: String(compensation.target_range ?? ""),
     geographicPreferences: String(compensation.location_flexibility ?? location.onsite_availability ?? ""),
     standardAnswers,
+    reusableAnswers: reusable,
+    verification: profileVerification(contact, reusable, resumes),
     resumeVariants: [String(asRecord(profile?.cv).output_format ?? "html")].filter(Boolean),
+    resumeLibrary: resumes,
+    companyAnswerPacks: readCompanyAnswerPacks(persistedProfile.userId, persistedProfile.profileScope),
     dreamCompanies: companyPrioritiesFromProfile(profile).filter((priority) => priority.tier != null),
     excludedRoleTypes: [
       "Junior / entry-level",

@@ -1,9 +1,14 @@
+import { requireAuth, requireSameOrigin } from "@/lib/auth/guards";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
 import { careerOpsRoot } from "@/lib/career-ops";
 import { atomicWriteWithBackup } from "@/lib/core/safe-write";
 import { logInternalError } from "@/lib/security/errors";
+import { commandCenterData } from "@/lib/command-center/service";
+import { readProfileRecord, updateProfileRecord, type ProfilePatch as StructuredProfilePatch } from "@/lib/command-center/profile-store";
+import { invalidatePackagesForProfileSnapshot } from "@/lib/command-center/application-packages";
+import { profileHash } from "@/lib/command-center/profile-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,7 +19,7 @@ export const dynamic = "force-dynamic";
 // proposed keys, write atomically (temp + rename), and only ever via the confirm-
 // gated setProfile action. The web orchestrates the real file — no parallel store.
 
-type ProfilePatch = {
+type LegacyProfilePatch = {
   name?: string;
   email?: string;
   location?: string;
@@ -38,7 +43,7 @@ function deepMerge(dst: unknown, src: Record<string, unknown>): Record<string, u
   return out;
 }
 
-function patchToProfile(p: ProfilePatch): Record<string, unknown> {
+function patchToProfile(p: LegacyProfilePatch): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   const candidate: Record<string, unknown> = {};
   if (p.name) candidate.full_name = p.name;
@@ -57,12 +62,29 @@ function patchToProfile(p: ProfilePatch): Record<string, unknown> {
 }
 
 export async function POST(req: Request) {
-  let patch: ProfilePatch;
+  const auth = await requireAuth();
+  if (!auth.ok) return auth.response;
+  const origin = requireSameOrigin(req);
+  if (!origin.ok) return origin.response;
+
+  let patch: LegacyProfilePatch & { profile?: StructuredProfilePatch };
   try {
-    patch = (await req.json()) as ProfilePatch;
+    patch = (await req.json()) as LegacyProfilePatch & { profile?: StructuredProfilePatch };
   } catch {
     return Response.json({ error: "bad json" }, { status: 400 });
   }
+
+  if (patch.profile) {
+    try {
+      const record = updateProfileRecord(auth.auth.userId, auth.auth.profileScope, patch.profile);
+      const invalidated = invalidatePackagesForProfileSnapshot(auth.auth.userId, auth.auth.profileScope, profileHash(record));
+      return Response.json({ ok: true, profile: record, invalidatedPackages: invalidated.map((pkg) => pkg.id) });
+    } catch (error) {
+      logInternalError("profile.structured_write", error);
+      return Response.json({ error: "Profile could not be saved." }, { status: 500 });
+    }
+  }
+
   const proposed = patchToProfile(patch);
   if (Object.keys(proposed).length === 0) return Response.json({ error: "nothing to write" }, { status: 400 });
 
@@ -101,4 +123,13 @@ export async function POST(req: Request) {
     return Response.json({ error: "Profile could not be saved." }, { status: 500 });
   }
   return Response.json({ ok: true, seeded });
+}
+
+export async function GET() {
+  const auth = await requireAuth();
+  if (!auth.ok) return auth.response;
+  return Response.json({
+    profile: commandCenterData().profile,
+    record: readProfileRecord(auth.auth.userId, auth.auth.profileScope),
+  });
 }

@@ -1,7 +1,8 @@
 import Link from "next/link";
-import { BriefcaseBusiness, GraduationCap, LinkIcon, MapPin, Pencil, ShieldCheck, Sparkles, UserRound } from "lucide-react";
-import type { ProfileView } from "@/lib/command-center/types";
+import { AlertTriangle, BriefcaseBusiness, CheckCircle2, FileText, GraduationCap, LinkIcon, MapPin, Pencil, ShieldCheck, Sparkles, UserRound } from "lucide-react";
+import type { ProfileView, VerificationState } from "@/lib/command-center/types";
 import { safeExternalHref } from "@/lib/security/url";
+import { ProfileDataManager } from "./profile-data-manager";
 
 export function ProfileCommandCenter({ profile }: { profile: ProfileView }) {
   return (
@@ -112,6 +113,25 @@ export function ProfileCommandCenter({ profile }: { profile: ProfileView }) {
 
         <section className="rounded-xl border border-border bg-surface/45 p-5">
           <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.16em] text-muted">
+            <CheckCircle2 className="size-4 text-brand" /> Verification
+          </h2>
+          <div className="mt-3 space-y-2">
+            {profile.verification.map((item) => (
+              <div key={item.id} className="rounded-md bg-background/45 px-3 py-2">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-medium text-foreground">{item.label}</div>
+                    <div className="mt-0.5 text-xs text-muted">{item.detail || item.source}</div>
+                  </div>
+                  <VerificationBadge status={item.status} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-border bg-surface/45 p-5">
+          <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.16em] text-muted">
             <Sparkles className="size-4 text-brand" /> Dream companies
           </h2>
           <div className="mt-3 grid gap-2 sm:grid-cols-2">
@@ -132,12 +152,19 @@ export function ProfileCommandCenter({ profile }: { profile: ProfileView }) {
           </h2>
           <div className="mt-3 grid gap-3 md:grid-cols-2">
             <div>
-              <h3 className="text-xs font-semibold uppercase tracking-wide text-faint">Standard answers</h3>
-              <dl className="mt-2 space-y-2 text-sm">
-                {Object.entries(profile.standardAnswers).map(([key, value]) => (
-                  <Row key={key} label={key.replaceAll("_", " ")} value={value} />
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-faint">Reusable answers</h3>
+              <div className="mt-2 space-y-2">
+                {profile.reusableAnswers.map((answer) => (
+                  <div key={answer.id} className="rounded-md bg-background/45 px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-sm font-medium text-foreground">{answer.label}</div>
+                      <VerificationBadge status={answer.verification} />
+                    </div>
+                    <p className="mt-1 text-sm text-muted">{answer.value || "-"}</p>
+                    <p className="mt-1 text-xs text-faint">{answer.safeToAutofill ? "Safe autofill" : "Review before use"}</p>
+                  </div>
                 ))}
-              </dl>
+              </div>
             </div>
             <div>
               <h3 className="text-xs font-semibold uppercase tracking-wide text-faint">Excluded role types</h3>
@@ -149,7 +176,36 @@ export function ProfileCommandCenter({ profile }: { profile: ProfileView }) {
             </div>
           </div>
         </section>
+
+        <section className="rounded-xl border border-border bg-surface/45 p-5 lg:col-span-2">
+          <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.16em] text-muted">
+            <FileText className="size-4 text-brand" /> Resume Library
+          </h2>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            {profile.resumeLibrary.map((resume) => (
+              <article key={resume.id} className="rounded-md border border-border bg-background/45 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-medium text-foreground">{resume.label}</div>
+                    <div className="mt-1 text-xs text-muted">{resume.path}</div>
+                  </div>
+                  <span className="rounded-md bg-surface-hover px-2 py-1 text-xs text-muted">{resume.isDefault ? "default" : resume.format}</span>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {resume.recommendedFor.map((item) => (
+                    <span key={item} className="rounded-md bg-surface-hover px-2 py-1 text-xs text-muted">{item}</span>
+                  ))}
+                </div>
+                <div className="mt-3 flex items-center justify-between gap-3 text-xs text-faint">
+                  <span>{resume.updatedAt ? `Updated ${new Date(resume.updatedAt).toLocaleDateString()}` : "No timestamp"}</span>
+                  <VerificationBadge status={resume.status === "ready" ? "verified" : "missing"} />
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
       </div>
+      <ProfileDataManager />
     </div>
   );
 }
@@ -160,5 +216,20 @@ function Row({ label, value }: { label: string; value?: string }) {
       <dt className="capitalize text-muted">{label}</dt>
       <dd className="max-w-[62%] text-right text-foreground">{value || "-"}</dd>
     </div>
+  );
+}
+
+function VerificationBadge({ status }: { status: VerificationState }) {
+  const classes =
+    status === "verified"
+      ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+      : status === "needs_review"
+        ? "bg-amber-500/10 text-amber-800 dark:text-amber-300"
+        : "bg-red-500/10 text-red-700 dark:text-red-300";
+  const Icon = status === "verified" ? CheckCircle2 : AlertTriangle;
+  return (
+    <span className={`inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium ${classes}`}>
+      <Icon className="size-3.5" /> {status.replace("_", " ")}
+    </span>
   );
 }

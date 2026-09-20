@@ -4,7 +4,9 @@ import path from "node:path";
 import { atomicWrite } from "@/lib/core/safe-write";
 import { careerOpsRoot } from "@/lib/career-ops";
 import { normalizeExternalUrl } from "@/lib/security/url";
+import { answerHash, readCompanyAnswerPacks, readReusableAnswers } from "./answer-library";
 import { detectAts } from "./ats-adapters";
+import { materialProfileFields, profileHash, readProfileRecord } from "./profile-store";
 import type {
   ApplicationPackage,
   ApplicationPackageStatus,
@@ -12,6 +14,7 @@ import type {
   CompensationStatus,
   Job,
   ProfileView,
+  ResumeLibraryItem,
 } from "./types";
 
 const PACKAGE_DIR = "data/application-packages";
@@ -140,14 +143,6 @@ function quarantinePackageFile(file: string, code: PackageValidationErrorCode, p
   auditPackageEvent("application_package_quarantined", { code, packageId: packageId ?? "unknown" });
 }
 
-function hasResume(): boolean {
-  try {
-    return fs.existsSync(path.join(careerOpsRoot(), MASTER_RESUME));
-  } catch {
-    return false;
-  }
-}
-
 function normalizeForHash(pkg: Omit<ApplicationPackage, "packageHash">): unknown {
   const { status: _status, approval: _approval, createdAt: _createdAt, updatedAt: _updatedAt, ...hashable } = pkg;
   return hashable;
@@ -216,6 +211,14 @@ function validateApplicationPackageShape(value: unknown): value is ApplicationPa
   if (typeof value.packageHash !== "string" || !HASH_RE.test(value.packageHash)) return false;
   if (!isString(value.company) || !isString(value.title)) return false;
   if (!isPackageStatus(value.status)) return false;
+  if (value.userId !== undefined && typeof value.userId !== "string") return false;
+  if (value.profileScope !== undefined && typeof value.profileScope !== "string") return false;
+  if (value.profileSnapshot !== undefined) {
+    if (!isRecord(value.profileSnapshot)) return false;
+    if (typeof value.profileSnapshot.version !== "number" || !Number.isSafeInteger(value.profileSnapshot.version)) return false;
+    if (typeof value.profileSnapshot.hash !== "string" || !HASH_RE.test(value.profileSnapshot.hash)) return false;
+    if (!isString(value.profileSnapshot.reference)) return false;
+  }
   if (value.approvalRequired !== "prepare_application" || value.submitApprovalRequired !== "submit_application") return false;
   if (!isString(value.materialSummary)) return false;
   if (value.atsType !== "greenhouse" && value.atsType !== "lever" && value.atsType !== "ashby" && value.atsType !== "workday" && value.atsType !== "unknown") return false;
@@ -225,8 +228,25 @@ function validateApplicationPackageShape(value: unknown): value is ApplicationPa
   if (value.compensationStatus !== "preferred" && value.compensationStatus !== "eligible_unknown" && value.compensationStatus !== "comp_exception_low_priority" && value.compensationStatus !== "unknown") return false;
   if (!stringArray(value.roleFitExplanation)) return false;
   if (!isRecord(value.selectedResume) || !isString(value.selectedResume.label)) return false;
+  if (value.selectedResume.id !== undefined && typeof value.selectedResume.id !== "string") return false;
   if (value.selectedResume.path !== undefined && typeof value.selectedResume.path !== "string") return false;
   if (value.selectedResume.status !== "ready" && value.selectedResume.status !== "pending") return false;
+  if (value.selectedResume.version !== undefined && (typeof value.selectedResume.version !== "number" || !Number.isSafeInteger(value.selectedResume.version))) return false;
+  if (value.selectedResume.selection !== undefined && value.selectedResume.selection !== "recommended" && value.selectedResume.selection !== "override") return false;
+  if (value.selectedResume.recommendationReason !== undefined && typeof value.selectedResume.recommendationReason !== "string") return false;
+  if (value.selectedResume.overrideReason !== undefined && typeof value.selectedResume.overrideReason !== "string") return false;
+  if (value.reusableAnswerRefs !== undefined) {
+    if (!Array.isArray(value.reusableAnswerRefs)) return false;
+    if (!value.reusableAnswerRefs.every((item) => isRecord(item) && isString(item.id) && HASH_RE.test(String(item.hash)) && (item.classification === "SAFE_AUTOFILL" || item.classification === "REVIEW_REQUIRED" || item.classification === "USER_REQUIRED"))) return false;
+  }
+  if (value.companyAnswerRefs !== undefined) {
+    if (!Array.isArray(value.companyAnswerRefs)) return false;
+    if (!value.companyAnswerRefs.every((item) => isRecord(item) && isString(item.packId) && isString(item.entryId) && HASH_RE.test(String(item.hash)) && (item.classification === "SAFE_AUTOFILL" || item.classification === "REVIEW_REQUIRED" || item.classification === "USER_REQUIRED"))) return false;
+  }
+  if (value.packageIssues !== undefined) {
+    if (!isRecord(value.packageIssues)) return false;
+    if (!stringArray(value.packageIssues.missingFields) || !stringArray(value.packageIssues.reviewRequiredFields) || !stringArray(value.packageIssues.userRequiredFields) || !stringArray(value.packageIssues.warnings)) return false;
+  }
   if (!stringArray(value.tailoredResumeChanges)) return false;
   if (!isRecord(value.coverLetter) || typeof value.coverLetter.useful !== "boolean") return false;
   if (value.coverLetter.status !== "ready" && value.coverLetter.status !== "not_needed" && value.coverLetter.status !== "pending") return false;
@@ -302,6 +322,90 @@ function roleFitExplanation(job: Job): string[] {
   return [...new Set(bullets)].slice(0, 4);
 }
 
+function fallbackResume(): ResumeLibraryItem {
+  const absolute = path.join(careerOpsRoot(), MASTER_RESUME);
+  const ready = fs.existsSync(absolute);
+  return {
+    id: "resume-master-ats",
+    label: "David Scott Applied AI Resume",
+    path: MASTER_RESUME,
+    format: "pdf",
+    status: ready ? "ready" : "missing",
+    isDefault: true,
+    recommendedFor: ["Applied AI", "AI architecture", "AI transformation", "agentic operations"],
+    notes: "Default ATS-ready resume for application packages.",
+  };
+}
+
+function scoreResume(resume: ResumeLibraryItem, job: Job): number {
+  const haystack = `${resume.label} ${resume.recommendedFor.join(" ")} ${resume.notes ?? ""}`.toLowerCase();
+  const role = `${job.title} ${job.fitSummary} ${job.evaluation?.summary ?? ""}`.toLowerCase();
+  let score = resume.isDefault ? 20 : 0;
+  if (resume.status === "ready") score += 10;
+  if (resume.format === "pdf") score += 4;
+  for (const term of ["applied ai", "ai architect", "solutions architect", "agentic", "transformation", "automation"]) {
+    if (role.includes(term) && haystack.includes(term)) score += 8;
+  }
+  if (/product|program|director|head/.test(role) && /leader|director|transformation/.test(haystack)) score += 5;
+  return score;
+}
+
+function selectedResumeFor(
+  profile: ProfileView,
+  job: Job,
+  existing?: ApplicationPackage,
+  overrideResumeId?: string,
+): ApplicationPackage["selectedResume"] {
+  const library = (profile.resumeLibrary?.length ? profile.resumeLibrary : [fallbackResume()]);
+  const overrideId = overrideResumeId ?? (existing?.selectedResume.selection === "override" ? existing.selectedResume.id : undefined);
+  const override = overrideId ? library.find((resume) => resume.id === overrideId) : undefined;
+  const recommended = [...library].sort((a, b) => scoreResume(b, job) - scoreResume(a, job))[0] ?? fallbackResume();
+  const chosen = override ?? recommended;
+  return {
+    id: chosen.id,
+    label: chosen.label,
+    path: chosen.status === "ready" ? chosen.path : undefined,
+    status: chosen.status === "ready" ? "ready" : "pending",
+    version: chosen.version ?? 1,
+    selection: override ? "override" : "recommended",
+    recommendationReason: override
+      ? `David override. Career Ops recommended ${recommended.label}.`
+      : `Recommended for ${job.title} based on ready status, ATS format, and role alignment.`,
+    overrideReason: override ? "Manual resume override selected during package review." : undefined,
+  };
+}
+
+function packageIssues(questions: ApplicationQuestion[], selectedResume: ApplicationPackage["selectedResume"], atsType: ApplicationPackage["atsType"]): ApplicationPackage["packageIssues"] {
+  return {
+    missingFields: questions.filter((question) => !question.value && !question.draft).map((question) => question.id),
+    reviewRequiredFields: questions.filter((question) => question.classification === "REVIEW_REQUIRED").map((question) => question.id),
+    userRequiredFields: questions.filter((question) => question.classification === "USER_REQUIRED").map((question) => question.id),
+    warnings: [
+      atsType === "unknown" ? "ATS is not supported yet; this package can be reviewed but not executed." : "",
+      selectedResume.status !== "ready" ? "Selected resume file is pending." : "",
+    ].filter(Boolean),
+  };
+}
+
+function reusableAnswerRefs(profile: ProfileView): ApplicationPackage["reusableAnswerRefs"] {
+  return readReusableAnswers(profile.userId ?? "career-ops-operator", profile.profileScope ?? "career-ops").map((answer) => ({
+    id: answer.id,
+    classification: answer.classification ?? "REVIEW_REQUIRED",
+    hash: answerHash(answer),
+  }));
+}
+
+function companyAnswerRefs(profile: ProfileView, company: string): ApplicationPackage["companyAnswerRefs"] {
+  return readCompanyAnswerPacks(profile.userId ?? "career-ops-operator", profile.profileScope ?? "career-ops")
+    .filter((pack) => [pack.company, ...pack.aliases].map((item) => item.toLowerCase()).includes(company.toLowerCase()))
+    .flatMap((pack) => pack.entries.filter((entry) => !entry.isArchived).map((entry) => ({
+      packId: pack.id,
+      entryId: entry.id,
+      classification: entry.classification,
+      hash: answerHash(entry),
+    })));
+}
+
 function applicationQuestions(profile: ProfileView, job: Job): ApplicationQuestion[] {
   const workAuth = profile.standardAnswers.work_authorization?.trim();
   const onsite = profile.standardAnswers.onsite_availability?.trim();
@@ -352,15 +456,18 @@ function outreachDraft(job: Job): ApplicationPackage["outreachDraft"] {
 export function buildApplicationPackage(
   job: Job,
   profile: ProfileView,
-  options: { status?: ApplicationPackageStatus; existing?: ApplicationPackage } = {},
+  options: { status?: ApplicationPackageStatus; existing?: ApplicationPackage; resumeOverrideId?: string } = {},
 ): ApplicationPackage {
   const timestamp = nowIso();
   const canonicalJobUrl = normalizeExternalUrl(job.sourceUrl);
   if (!canonicalJobUrl) throw new Error("job source URL is not a valid external URL");
   const canonicalApply = normalizeExternalUrl(job.canonicalApplyUrl) ?? canonicalJobUrl;
   const atsRef = detectAts(canonicalApply);
-  const resumeReady = hasResume();
   const status = options.status ?? options.existing?.status ?? "READY_FOR_REVIEW";
+  const selectedResume = selectedResumeFor(profile, job, options.existing, options.resumeOverrideId);
+  const questions = applicationQuestions(profile, job);
+  const persistedProfile = readProfileRecord(profile.userId ?? "career-ops-operator", profile.profileScope ?? "career-ops");
+  const atsType = atsRef?.atsType ?? "unknown";
   const base: Omit<ApplicationPackage, "packageHash"> = {
     id: options.existing?.id ?? safeId(job.id),
     schemaVersion: SCHEMA_VERSION,
@@ -370,20 +477,23 @@ export function buildApplicationPackage(
     company: job.company,
     title: job.title,
     status,
+    userId: profile.userId ?? persistedProfile.userId,
+    profileScope: profile.profileScope ?? persistedProfile.profileScope,
+    profileSnapshot: {
+      version: persistedProfile.version,
+      hash: profileHash(persistedProfile),
+      reference: `profile:${persistedProfile.userId}:${persistedProfile.profileScope}:v${persistedProfile.version}`,
+    },
     approvalRequired: "prepare_application",
     submitApprovalRequired: "submit_application",
     materialSummary: "Application package created for David review. External submission is disabled.",
-    atsType: atsRef?.atsType ?? "unknown",
+    atsType,
     canonicalJobUrl,
     canonicalApplyUrl: canonicalApply,
     baseRoleFit: job.fitScore,
     compensationStatus: compensationStatus(job.compensation),
     roleFitExplanation: roleFitExplanation(job),
-    selectedResume: {
-      label: "David Scott Applied AI Resume",
-      path: resumeReady ? MASTER_RESUME : undefined,
-      status: resumeReady ? "ready" : "pending",
-    },
+    selectedResume,
     tailoredResumeChanges: [
       "No tailored resume changes generated in this slice.",
       "Career Ops will require review before any role-specific resume edits are used.",
@@ -393,7 +503,10 @@ export function buildApplicationPackage(
       status: "pending",
       draft: "Cover letter generation is pending. This package can still be reviewed without one.",
     },
-    questions: applicationQuestions(profile, job),
+    questions,
+    reusableAnswerRefs: reusableAnswerRefs(profile),
+    companyAnswerRefs: companyAnswerRefs(profile, job.company),
+    packageIssues: packageIssues(questions, selectedResume, atsType),
     outreachDraft: outreachDraft(job),
     reportHref: job.reportHref,
     approval: status === "APPROVED" ? options.existing?.approval : undefined,
@@ -458,11 +571,71 @@ export function writeApplicationPackage(pkg: ApplicationPackage): ApplicationPac
   return pkg;
 }
 
+function rehashPackageMutation(pkg: ApplicationPackage, reason: string): ApplicationPackage {
+  const { packageHash: _packageHash, ...withoutHash } = pkg;
+  return withHash({
+    ...withoutHash,
+    status: pkg.status === "APPROVED" || pkg.status === "REJECTED" ? "READY_FOR_REVIEW" : pkg.status,
+    approval: undefined,
+    version: pkg.version + 1,
+    materialSummary: `${pkg.materialSummary} Review reset: ${reason}`,
+    updatedAt: nowIso(),
+  });
+}
+
+export function invalidatePackagesForProfileSnapshot(userId: string, profileScope: string, currentProfileHash: string): ApplicationPackage[] {
+  const changed = readApplicationPackages().filter((pkg) =>
+    pkg.userId === userId &&
+    pkg.profileScope === profileScope &&
+    pkg.profileSnapshot?.hash &&
+    pkg.profileSnapshot.hash !== currentProfileHash &&
+    (pkg.status === "APPROVED" || pkg.approval),
+  );
+  return changed.map((pkg) => writeApplicationPackage(rehashPackageMutation(pkg, "profile facts used by this package changed.")));
+}
+
+export function invalidatePackagesForAnswer(answerId: string, nextHash: string): ApplicationPackage[] {
+  const changed = readApplicationPackages().filter((pkg) => {
+    const reusable = pkg.reusableAnswerRefs?.find((ref) => ref.id === answerId && ref.hash !== nextHash);
+    const company = pkg.companyAnswerRefs?.find((ref) => ref.entryId === answerId && ref.hash !== nextHash);
+    return Boolean((reusable || company) && (pkg.status === "APPROVED" || pkg.approval));
+  });
+  return changed.map((pkg) => writeApplicationPackage(rehashPackageMutation(pkg, "answer text used by this package changed.")));
+}
+
 export function prepareApplicationPackage(job: Job, profile: ProfileView): ApplicationPackage {
   const existing = findApplicationPackage(safeId(job.id)) ?? undefined;
   const requestedStatus = existing?.status === "APPROVED" ? existing.status : "READY_FOR_REVIEW";
   const pkg = buildApplicationPackage(job, profile, { existing, status: requestedStatus });
   return writeApplicationPackage(pkg);
+}
+
+export function overrideApplicationPackageResume(
+  id: string,
+  packageHash: string,
+  expectedVersion: number,
+  resumeId: string,
+  profile: ProfileView,
+  job: Job,
+): { ok: true; package: ApplicationPackage } | { ok: false; status: number; error: string } {
+  const read = readApplicationPackage(id);
+  if (!read.ok) return { ok: false, status: read.status, error: read.error };
+  const existing = read.package;
+  const actualHash = recomputePackageHash(existing);
+  if (actualHash !== existing.packageHash || existing.packageHash !== packageHash) {
+    return { ok: false, status: 409, error: "package changed after review; reload before changing resume" };
+  }
+  if (existing.version !== expectedVersion) {
+    return { ok: false, status: 409, error: "package version changed after review; reload before changing resume" };
+  }
+  const resume = profile.resumeLibrary.find((item) => item.id === resumeId);
+  if (!resume) return { ok: false, status: 400, error: "resume is not in the profile library" };
+  const next = buildApplicationPackage(job, profile, {
+    existing,
+    status: existing.status === "APPROVED" || existing.status === "REJECTED" ? "READY_FOR_REVIEW" : existing.status,
+    resumeOverrideId: resume.id,
+  });
+  return { ok: true, package: writeApplicationPackage(next) };
 }
 
 export function decideApplicationPackage(

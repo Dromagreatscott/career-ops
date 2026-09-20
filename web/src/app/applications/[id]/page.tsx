@@ -2,9 +2,10 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { AlertTriangle, ArrowLeft, CheckCircle2, ExternalLink, FileText, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { findCommandCenterPackage } from "@/lib/command-center/service";
-import type { ApplicationPackage, QuestionClassification } from "@/lib/command-center/types";
+import { commandCenterData, findCommandCenterPackage } from "@/lib/command-center/service";
+import type { ApplicationPackage, QuestionClassification, VerificationState } from "@/lib/command-center/types";
 import { PackageDecisionActions } from "@/components/command-center/package-decision-actions";
+import { ResumeOverrideActions } from "@/components/command-center/resume-override-actions";
 
 export const dynamic = "force-dynamic";
 
@@ -12,9 +13,12 @@ export default async function ApplicationReviewPage({ params }: { params: Promis
   const { id } = await params;
   const pkg = findCommandCenterPackage(id);
   if (!pkg) return notFound();
+  const data = commandCenterData();
+  const profile = data.profile;
   const applicationPackage = pkg;
   const completeQuestions = applicationPackage.questions.filter((question) => question.classification !== "USER_REQUIRED").length;
   const warnings = warningsForPackage(applicationPackage);
+  const verifiedProfileItems = profile.verification.filter((item) => item.status === "verified").length;
 
   return (
     <div className="mx-auto max-w-5xl px-5 py-6 max-sm:pb-24 sm:px-6 sm:py-8">
@@ -81,12 +85,45 @@ export default async function ApplicationReviewPage({ params }: { params: Promis
                 <div>
                   <p className="text-sm font-medium text-foreground">{applicationPackage.selectedResume.label}</p>
                   <p className="mt-1 text-xs text-muted">{applicationPackage.selectedResume.path || "Resume file pending"}</p>
+                  {applicationPackage.selectedResume.recommendationReason ? (
+                    <p className="mt-1 text-xs text-faint">{applicationPackage.selectedResume.recommendationReason}</p>
+                  ) : null}
                 </div>
-                <Badge tone={applicationPackage.selectedResume.status === "ready" ? "good" : "warn"}>{applicationPackage.selectedResume.status}</Badge>
+                <div className="flex flex-wrap gap-2">
+                  <Badge tone={applicationPackage.selectedResume.status === "ready" ? "good" : "warn"}>{applicationPackage.selectedResume.status}</Badge>
+                  <Badge tone={applicationPackage.selectedResume.selection === "override" ? "warn" : "muted"}>
+                    {applicationPackage.selectedResume.selection ?? "recommended"}
+                  </Badge>
+                </div>
               </div>
               <div className="mt-3 space-y-1.5 text-sm text-muted">
                 {applicationPackage.tailoredResumeChanges.map((change) => <p key={change}>{change}</p>)}
               </div>
+              <ResumeOverrideActions
+                packageId={applicationPackage.id}
+                packageHash={applicationPackage.packageHash}
+                version={applicationPackage.version}
+                selectedResumeId={applicationPackage.selectedResume.id}
+                resumes={profile.resumeLibrary}
+              />
+            </div>
+          </section>
+
+          <section className="rounded-xl border border-border bg-surface/45 p-5">
+            <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-muted">Reusable Answers</h2>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              {profile.reusableAnswers.map((answer) => (
+                <div key={answer.id} className="rounded-md bg-background/45 px-3 py-2">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-medium text-foreground">{answer.label}</div>
+                      <p className="mt-1 text-sm text-muted">{answer.value || "-"}</p>
+                    </div>
+                    <VerificationPill status={answer.verification} />
+                  </div>
+                  <p className="mt-2 text-xs text-faint">{answer.safeToAutofill ? "Safe autofill" : "Review before use"}</p>
+                </div>
+              ))}
             </div>
           </section>
 
@@ -115,6 +152,7 @@ export default async function ApplicationReviewPage({ params }: { params: Promis
             <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-muted">Final Check</h2>
             <div className="mt-4 space-y-3 text-sm">
               <CheckLine label="Destination" value={applicationPackage.atsType} complete={applicationPackage.atsType !== "unknown"} />
+              <CheckLine label="Profile" value={`${verifiedProfileItems} / ${profile.verification.length} verified`} complete={profile.verification.every((item) => item.status !== "missing")} />
               <CheckLine label="Resume" value={applicationPackage.selectedResume.label} complete={applicationPackage.selectedResume.status === "ready"} />
               <CheckLine label="Questions" value={`${completeQuestions} / ${applicationPackage.questions.length} complete`} complete={completeQuestions === applicationPackage.questions.length} />
               <CheckLine label="Warnings" value={warnings.length ? `${warnings.length}` : "None"} complete={!warnings.length} />
@@ -125,6 +163,21 @@ export default async function ApplicationReviewPage({ params }: { params: Promis
                 {warnings.map((warning) => <p key={warning}>{warning}</p>)}
               </div>
             ) : null}
+          </section>
+
+          <section className="rounded-xl border border-border bg-surface/45 p-5">
+            <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-muted">Profile Verification</h2>
+            <div className="mt-3 space-y-2">
+              {profile.verification.map((item) => (
+                <div key={item.id} className="flex items-start justify-between gap-3 rounded-md bg-background/45 px-3 py-2">
+                  <div>
+                    <div className="text-sm font-medium text-foreground">{item.label}</div>
+                    <div className="mt-0.5 text-xs text-muted">{item.detail || item.source}</div>
+                  </div>
+                  <VerificationPill status={item.status} />
+                </div>
+              ))}
+            </div>
           </section>
 
           <section className="rounded-xl border border-border bg-surface/45 p-5">
@@ -178,6 +231,12 @@ function QuestionBadge({ classification }: { classification: QuestionClassificat
   if (classification === "SAFE_AUTOFILL") return <Badge tone="good">Autofill</Badge>;
   if (classification === "REVIEW_REQUIRED") return <Badge tone="warn">Review</Badge>;
   return <Badge tone="bad">Needs David</Badge>;
+}
+
+function VerificationPill({ status }: { status: VerificationState }) {
+  if (status === "verified") return <Badge tone="good">verified</Badge>;
+  if (status === "needs_review") return <Badge tone="warn">review</Badge>;
+  return <Badge tone="bad">missing</Badge>;
 }
 
 function warningsForPackage(pkg: ApplicationPackage): string[] {
