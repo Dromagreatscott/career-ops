@@ -4,6 +4,7 @@ import path from "node:path";
 import { careerOpsRoot } from "@/lib/career-ops";
 import { canonicalizeStatus } from "@/lib/core/states";
 import { atomicWrite } from "@/lib/core/safe-write";
+import { requireAuth, requireSameOrigin } from "@/lib/auth/guards";
 
 const PACKAGE_WORKFLOW_STATES = new Set([
   "DISCOVERED",
@@ -23,6 +24,11 @@ const PACKAGE_WORKFLOW_STATES = new Set([
 // value with table-breaking chars (| \r \n **) that would scramble the row; detect
 // the Status column from the header (8- and 9-col layouts); atomic write.
 export async function POST(req: Request) {
+  const auth = await requireAuth();
+  if (!auth.ok) return auth.response;
+  const sameOrigin = requireSameOrigin(req);
+  if (!sameOrigin.ok) return sameOrigin.response;
+
   let body: { n?: string; status?: string };
   try {
     body = await req.json();

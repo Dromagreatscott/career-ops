@@ -4,6 +4,7 @@ import path from "node:path";
 import { careerOpsRoot } from "@/lib/career-ops";
 import { atomicWriteWithBackup } from "@/lib/core/safe-write";
 import type {
+  ApplicationAccountState,
   ApplicationBlockerCode,
   ApplicationDryRunReport,
   ApplicationSession,
@@ -139,14 +140,39 @@ export function updateApplicationSession(
   return session;
 }
 
-export function markIntervention(id: string, code: ApplicationBlockerCode, message: string, action: string, report?: ApplicationDryRunReport): ApplicationSession | null {
+/**
+ * Map a blocker code to the account/interaction state the session should surface
+ * while it pauses for David. Authentication, account-creation, verification, MFA
+ * and CAPTCHA gates each get their own state so the UI can explain exactly what
+ * the human has to do next (and so a resume can be gated on the right action).
+ * Everything else falls back to the generic USER_INTERVENTION_REQUIRED state.
+ * Career Ops never bypasses any of these gates — it pauses and waits.
+ */
+export function accountStateForBlocker(code: ApplicationBlockerCode): ApplicationAccountState {
+  switch (code) {
+    case "LOGIN_REQUIRED":
+      return "ACCOUNT_EXISTS_LOGIN_REQUIRED";
+    case "ACCOUNT_CREATION_REQUIRED":
+      return "ACCOUNT_CREATION_REQUIRED";
+    case "EMAIL_VERIFICATION_REQUIRED":
+      return "EMAIL_VERIFICATION_REQUIRED";
+    case "MFA_REQUIRED":
+      return "MFA_REQUIRED";
+    case "CAPTCHA_REQUIRED":
+      return "CAPTCHA_REQUIRED";
+    default:
+      return "USER_INTERVENTION_REQUIRED";
+  }
+}
+
+export function markIntervention(id: string, code: ApplicationBlockerCode, message: string, action: string, report?: ApplicationDryRunReport, accountState?: ApplicationAccountState): ApplicationSession | null {
   return updateApplicationSession(id, {
     status: "USER_INTERVENTION_REQUIRED",
     lastStep: "USER_INTERVENTION_REQUIRED",
     lastErrorCode: code,
     requiresUserAction: true,
     userActionMessage: `${message} Action: ${action}`,
-    accountState: "USER_INTERVENTION_REQUIRED",
+    accountState: accountState ?? accountStateForBlocker(code),
     dryRunReport: report,
   }, event("USER_INTERVENTION_REQUIRED", `${code}: ${message}`));
 }
