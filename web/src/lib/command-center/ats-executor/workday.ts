@@ -77,7 +77,7 @@ export function classifyWorkdayIntervention(inspected: InspectedApplication): Ex
         "Open the verification email and confirm the account, then explicitly resume the session.",
       );
     }
-    if (/create (an? )?account|create your (candidate )?account|create (a )?password|sign ?up|\bregister\b|new to workday|set up your (candidate )?account|start your application by creating/.test(hay)) {
+    if (/create\b[\w\s'’-]{0,30}?\baccount\b|create (a )?password|sign ?up|\bregister\b|new to workday|set up your (candidate )?account|start your application by creating/.test(hay)) {
       return gate(
         "ACCOUNT_CREATION_REQUIRED",
         "Workday requires creating a candidate account before applying.",

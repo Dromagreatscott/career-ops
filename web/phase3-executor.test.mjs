@@ -413,6 +413,18 @@ test("Workday account-creation gate → ACCOUNT_CREATION_REQUIRED", () => {
   assert.equal(sessions.accountStateForBlocker(blocker.code), "ACCOUNT_CREATION_REQUIRED");
 });
 
+test("Workday account-creation gate → ACCOUNT_CREATION_REQUIRED without a clean heading", () => {
+  // Regression: the only account signal is the message phrasing "create a
+  // candidate account" (adjective between "a" and "account"), with no "Create
+  // Account" title and a generic diagnose code of "login-wall". Must still
+  // classify as account creation, not login.
+  const blocker = workday.classifyWorkdayIntervention(
+    inspectedForm({ title: "", issues: [{ code: "login-wall", message: "Create a candidate account to start your application", level: "block" }] })
+  );
+  assert.equal(blocker.code, "ACCOUNT_CREATION_REQUIRED");
+  assert.equal(sessions.accountStateForBlocker(blocker.code), "ACCOUNT_CREATION_REQUIRED");
+});
+
 test("Workday email-verification gate → EMAIL_VERIFICATION_REQUIRED", () => {
   const blocker = workday.classifyWorkdayIntervention(
     inspectedForm({ title: "Verify your email", issues: [{ code: "no-form", message: "Check your inbox to verify your email address before continuing", level: "block" }] })
