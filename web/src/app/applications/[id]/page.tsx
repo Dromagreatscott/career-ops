@@ -4,11 +4,12 @@ import { AlertTriangle, ArrowLeft, CheckCircle2, ExternalLink, FileText, ShieldC
 import { Badge } from "@/components/ui/badge";
 import { commandCenterData, findCommandCenterPackage } from "@/lib/command-center/service";
 import { readApplicationSessions } from "@/lib/command-center/application-sessions";
-import { validateExecutionUrlSyncForTest } from "@/lib/command-center/executor-url";
+import { executionReadiness } from "@/lib/command-center/execution-readiness";
 import type { ApplicationPackage, ApplicationSession, QuestionClassification, VerificationState } from "@/lib/command-center/types";
 import { PackageDecisionActions } from "@/components/command-center/package-decision-actions";
 import { ResumeOverrideActions } from "@/components/command-center/resume-override-actions";
 import { PackageExecutionActions } from "@/components/command-center/package-execution-actions";
+import { EditQuestionActions } from "@/components/command-center/edit-question-actions";
 
 export const dynamic = "force-dynamic";
 
@@ -146,9 +147,12 @@ export default async function ApplicationReviewPage({ params }: { params: Promis
                   </div>
                   <p className="mt-2 text-sm leading-relaxed text-muted">{question.value || question.draft || "No answer yet."}</p>
                   <p className="mt-2 text-xs text-faint">{question.explanation}</p>
-                  <button className="mt-3 inline-flex min-h-9 items-center justify-center rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted" disabled>
-                    Edit pending
-                  </button>
+                  <EditQuestionActions
+                    packageId={applicationPackage.id}
+                    packageHash={applicationPackage.packageHash}
+                    version={applicationPackage.version}
+                    question={question}
+                  />
                 </article>
               ))}
             </div>
@@ -223,7 +227,7 @@ export default async function ApplicationReviewPage({ params }: { params: Promis
             <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-muted">Submit Executor</h2>
             <div className="mt-3 flex items-start gap-2 rounded-md bg-background/45 p-3 text-sm text-muted">
               <ShieldCheck className="mt-0.5 size-4 shrink-0 text-brand" />
-              Greenhouse/Lever execution is package-gated. Dry run stops before final submit.
+              Greenhouse / Lever / Ashby / Workday execution is package-gated; an unknown ATS uses generic manual assist. Dry run always stops before final submit.
             </div>
             <div className="mt-4">
               <PackageExecutionActions
@@ -281,32 +285,6 @@ function warningsForPackage(pkg: ApplicationPackage): string[] {
     pkg.selectedResume.status !== "ready" ? "Selected resume file is pending." : "",
     pkg.questions.some((question) => question.classification === "USER_REQUIRED") ? "At least one answer needs David before submission." : "",
   ].filter(Boolean);
-}
-
-function executionReadiness(pkg: ApplicationPackage) {
-  const url = validateExecutionUrlSyncForTest(pkg.canonicalApplyUrl ?? pkg.canonicalJobUrl);
-  const supported = pkg.atsType === "greenhouse" || pkg.atsType === "lever";
-  const userRequired = pkg.questions.filter((question) => question.classification === "USER_REQUIRED");
-  const reviewRequired = pkg.questions.filter((question) => question.classification === "REVIEW_REQUIRED");
-  const approvalValid = pkg.status === "APPROVED" && pkg.approval?.status === "approved" && pkg.approval.packageHash === pkg.packageHash;
-  const warnings = [
-    supported ? "" : "Unsupported ATS. Use manual mode or wait for a supported adapter.",
-    url.ok ? "" : "Application URL is not safe or valid for browser execution.",
-    pkg.selectedResume.status === "ready" ? "" : "Selected resume is not ready.",
-    userRequired.length ? `${userRequired.length} field(s) still need David.` : "",
-    reviewRequired.some((question) => !question.value && question.draft) ? "Review-required drafts should be approved before live submission." : "",
-    approvalValid ? "" : "Exact package approval is required for live execution.",
-  ].filter(Boolean);
-  return {
-    ats: supported ? "SUPPORTED" : "UNSUPPORTED",
-    url: url.ok ? "VALID" : "INVALID",
-    resume: pkg.selectedResume.status === "ready" ? "READY" : "MISSING",
-    profile: pkg.profileSnapshot ? "READY" : "INCOMPLETE",
-    answers: userRequired.length ? "NEEDS YOU" : reviewRequired.length ? "NEEDS REVIEW" : "AUTO-FILL READY",
-    approval: approvalValid ? "VALID" : "REQUIRED",
-    warnings,
-    readyForLive: supported && url.ok && pkg.selectedResume.status === "ready" && !userRequired.length && approvalValid,
-  };
 }
 
 function ExecutionSessionSummary({ session }: { session: ApplicationSession }) {

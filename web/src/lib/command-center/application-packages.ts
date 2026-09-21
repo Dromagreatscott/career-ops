@@ -14,6 +14,7 @@ import type {
   CompensationStatus,
   Job,
   ProfileView,
+  QuestionClassification,
   ResumeLibraryItem,
 } from "./types";
 
@@ -637,6 +638,83 @@ export function overrideApplicationPackageResume(
     resumeOverrideId: resume.id,
   });
   return { ok: true, package: writeApplicationPackage(next) };
+}
+
+/**
+ * Persist David's edited/approved answer for a single application question on the
+ * canonical package (never a parallel answer store).
+ *
+ * Safety, mirroring the resume-override / decision guards:
+ *  - Exact-approval gate: the caller's packageHash + version must match the current
+ *    package, else 409 (stale) — no edit races an approval.
+ *  - USER_REQUIRED can never silently auto-resolve: an empty answer is rejected, and
+ *    an explicit non-empty answer resolves it to REVIEW_REQUIRED — NEVER SAFE_AUTOFILL.
+ *  - SAFE_AUTOFILL is never produced by an edit (defense in depth); an existing
+ *    SAFE_AUTOFILL is preserved (profile-driven, edited on the Profile page).
+ *  - A material change (value or classification) bumps version, clears approval,
+ *    resets APPROVED/REJECTED → READY_FOR_REVIEW, recomputes packageIssues + hash.
+ *    An identical answer is a no-op (no version bump, approval preserved).
+ */
+export function updateApplicationPackageQuestion(
+  id: string,
+  packageHash: string,
+  expectedVersion: number,
+  questionId: string,
+  answer: string,
+): { ok: true; package: ApplicationPackage; changed: boolean } | { ok: false; status: number; error: string } {
+  const read = readApplicationPackage(id);
+  if (!read.ok) return { ok: false, status: read.status, error: read.error };
+  const existing = read.package;
+  const actualHash = recomputePackageHash(existing);
+  if (actualHash !== existing.packageHash || existing.packageHash !== packageHash) {
+    return { ok: false, status: 409, error: "package changed after review; reload before editing answers" };
+  }
+  if (existing.version !== expectedVersion) {
+    return { ok: false, status: 409, error: "package version changed after review; reload before editing answers" };
+  }
+  const target = existing.questions.find((question) => question.id === questionId);
+  if (!target) return { ok: false, status: 404, error: "question not found in this package" };
+
+  const trimmed = String(answer ?? "").trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      status: 400,
+      error: target.classification === "USER_REQUIRED"
+        ? "this answer needs David; provide a value before saving"
+        : "answer cannot be empty",
+    };
+  }
+
+  // USER_REQUIRED → REVIEW_REQUIRED on explicit David input; everything else keeps
+  // its classification. An edit NEVER yields SAFE_AUTOFILL unless it already was.
+  let nextClassification: QuestionClassification =
+    target.classification === "USER_REQUIRED" ? "REVIEW_REQUIRED" : target.classification;
+  if (nextClassification === "SAFE_AUTOFILL" && target.classification !== "SAFE_AUTOFILL") {
+    nextClassification = "REVIEW_REQUIRED";
+  }
+
+  const materiallyChanged = target.value !== trimmed || target.classification !== nextClassification;
+  if (!materiallyChanged) return { ok: true, package: existing, changed: false };
+
+  const nextQuestions: ApplicationQuestion[] = existing.questions.map((question) =>
+    question.id === questionId
+      ? { ...question, value: trimmed, draft: undefined, source: "user", classification: nextClassification }
+      : question,
+  );
+
+  const { packageHash: _packageHash, ...withoutHash } = existing;
+  const next = withHash({
+    ...withoutHash,
+    questions: nextQuestions,
+    packageIssues: packageIssues(nextQuestions, existing.selectedResume, existing.atsType),
+    status: existing.status === "APPROVED" || existing.status === "REJECTED" ? "READY_FOR_REVIEW" : existing.status,
+    approval: undefined,
+    version: existing.version + 1,
+    materialSummary: `${existing.materialSummary} Review reset: David edited the "${target.label}" answer.`,
+    updatedAt: nowIso(),
+  });
+  return { ok: true, package: writeApplicationPackage(next), changed: true };
 }
 
 export function decideApplicationPackage(

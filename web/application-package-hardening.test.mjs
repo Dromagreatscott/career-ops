@@ -13,6 +13,7 @@ const jiti = createJiti(import.meta.url, {
 const packages = jiti("./src/lib/command-center/application-packages.ts");
 const urls = jiti("./src/lib/security/url.ts");
 const statusRoute = jiti("./src/app/api/status/route.ts");
+const readiness = jiti("./src/lib/command-center/execution-readiness.ts");
 
 function tempRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "career-ops-hardening-"));
@@ -229,4 +230,197 @@ test("anonymous status updates are denied without echoing raw internal-looking v
   const body = await res.json();
   assert.equal(res.status, 401);
   assert.equal(String(body.error).includes(secret), false);
+});
+
+// ---------------------------------------------------------------------------
+// Edit-pending answer workflow + Phase 3 ATS readiness sync
+// ---------------------------------------------------------------------------
+
+const REVIEW_Q = { id: "q_review", label: "Why do you want to join Acme?", explanation: "Career Ops drafted this; review before approval.", classification: "REVIEW_REQUIRED", source: "career_ops", draft: "Draft answer." };
+const USER_Q = { id: "q_user", label: "Desired salary", explanation: "Sensitive — needs David.", classification: "USER_REQUIRED", source: "career_ops" };
+const SAFE_Q = { id: "q_safe", label: "Email", explanation: "From verified profile.", classification: "SAFE_AUTOFILL", source: "profile", value: "david@example.com" };
+
+/** Persist a package carrying explicit questions (optionally APPROVED), recomputing
+ *  the canonical hash so writeApplicationPackage accepts it. */
+function persistWithQuestions(questions, opts = {}) {
+  const base = packages.buildApplicationPackage(job(), profile());
+  const { packageHash: _drop, ...rest } = base;
+  const draft = { ...rest, questions, version: opts.version ?? 1, status: opts.status ?? "READY_FOR_REVIEW", approval: undefined };
+  const hash = packages.computePackageHash(draft);
+  let pkg = { ...draft, packageHash: hash };
+  if (opts.approved) pkg = { ...pkg, status: "APPROVED", approval: { status: "approved", packageHash: hash, decidedAt: new Date().toISOString() } };
+  return packages.writeApplicationPackage(pkg);
+}
+
+function questionById(pkg, id) {
+  return pkg.questions.find((q) => q.id === id);
+}
+
+test("edit pending: REVIEW_REQUIRED answer persists as the package answer", () => {
+  useRoot();
+  const pkg = persistWithQuestions([structuredClone(REVIEW_Q)]);
+  const res = packages.updateApplicationPackageQuestion(pkg.id, pkg.packageHash, pkg.version, "q_review", "David approved answer.");
+  assert.equal(res.ok, true);
+  assert.equal(res.changed, true);
+  const reread = packages.readApplicationPackage(pkg.id);
+  assert.equal(reread.ok, true);
+  const q = questionById(reread.package, "q_review");
+  assert.equal(q.value, "David approved answer.");
+  assert.equal(q.classification, "REVIEW_REQUIRED");
+  assert.equal(q.source, "user");
+  assert.equal(reread.package.version, pkg.version + 1);
+});
+
+test("edit pending: USER_REQUIRED resolves to REVIEW_REQUIRED, never SAFE_AUTOFILL", () => {
+  useRoot();
+  const pkg = persistWithQuestions([structuredClone(USER_Q)]);
+  const res = packages.updateApplicationPackageQuestion(pkg.id, pkg.packageHash, pkg.version, "q_user", "$180k base");
+  assert.equal(res.ok, true);
+  const q = questionById(res.package, "q_user");
+  assert.equal(q.value, "$180k base");
+  assert.notEqual(q.classification, "SAFE_AUTOFILL");
+  assert.equal(q.classification, "REVIEW_REQUIRED");
+});
+
+test("edit pending: empty USER_REQUIRED answer is rejected and never silently auto-resolves", () => {
+  useRoot();
+  const pkg = persistWithQuestions([structuredClone(USER_Q)]);
+  const res = packages.updateApplicationPackageQuestion(pkg.id, pkg.packageHash, pkg.version, "q_user", "   ");
+  assert.equal(res.ok, false);
+  assert.equal(res.status, 400);
+  const reread = packages.readApplicationPackage(pkg.id);
+  const q = questionById(reread.package, "q_user");
+  assert.equal(q.classification, "USER_REQUIRED");
+  assert.equal(q.value, undefined);
+  assert.equal(reread.package.version, pkg.version);
+});
+
+test("edit pending: SAFE_AUTOFILL stays SAFE_AUTOFILL even if edited via the API", () => {
+  useRoot();
+  const pkg = persistWithQuestions([structuredClone(SAFE_Q)]);
+  const res = packages.updateApplicationPackageQuestion(pkg.id, pkg.packageHash, pkg.version, "q_safe", "override@example.com");
+  assert.equal(res.ok, true);
+  const q = questionById(res.package, "q_safe");
+  assert.equal(q.classification, "SAFE_AUTOFILL");
+});
+
+test("edit pending: material edit bumps version and changes the hash", () => {
+  useRoot();
+  const pkg = persistWithQuestions([structuredClone(REVIEW_Q)]);
+  const res = packages.updateApplicationPackageQuestion(pkg.id, pkg.packageHash, pkg.version, "q_review", "A materially different answer.");
+  assert.equal(res.ok, true);
+  assert.equal(res.package.version, pkg.version + 1);
+  assert.notEqual(res.package.packageHash, pkg.packageHash);
+});
+
+test("edit pending: prior approval is invalidated after a material edit", () => {
+  useRoot();
+  const pkg = persistWithQuestions([structuredClone(REVIEW_Q)], { approved: true });
+  assert.equal(pkg.status, "APPROVED");
+  const res = packages.updateApplicationPackageQuestion(pkg.id, pkg.packageHash, pkg.version, "q_review", "Edited after approval.");
+  assert.equal(res.ok, true);
+  assert.equal(res.package.status, "READY_FOR_REVIEW");
+  assert.equal(res.package.approval, undefined);
+  assert.equal(res.package.version, pkg.version + 1);
+});
+
+test("edit pending: stale hash or version is rejected (approval race guard)", () => {
+  useRoot();
+  const pkg = persistWithQuestions([structuredClone(REVIEW_Q)]);
+  const badHash = packages.updateApplicationPackageQuestion(pkg.id, "0".repeat(64), pkg.version, "q_review", "x");
+  assert.equal(badHash.ok, false);
+  assert.equal(badHash.status, 409);
+  const badVersion = packages.updateApplicationPackageQuestion(pkg.id, pkg.packageHash, pkg.version + 5, "q_review", "x");
+  assert.equal(badVersion.ok, false);
+  assert.equal(badVersion.status, 409);
+});
+
+test("edit pending: identical answer is a no-op that preserves approval", () => {
+  useRoot();
+  const same = { ...structuredClone(REVIEW_Q), value: "Same answer.", draft: undefined };
+  const pkg = persistWithQuestions([same], { approved: true });
+  const res = packages.updateApplicationPackageQuestion(pkg.id, pkg.packageHash, pkg.version, "q_review", "Same answer.");
+  assert.equal(res.ok, true);
+  assert.equal(res.changed, false);
+  assert.equal(res.package.version, pkg.version);
+  assert.equal(res.package.status, "APPROVED");
+  assert.ok(res.package.approval);
+});
+
+test("edit pending: not saving (cancel) leaves the stored answer untouched", () => {
+  useRoot();
+  const pkg = persistWithQuestions([structuredClone(REVIEW_Q)]);
+  const before = packages.readApplicationPackage(pkg.id);
+  // Cancel performs no POST → the persisted package is byte-identical.
+  const after = packages.readApplicationPackage(pkg.id);
+  assert.deepEqual(after.package, before.package);
+});
+
+test("edit pending: completion/readiness advances after resolving USER_REQUIRED", () => {
+  useRoot();
+  const pkg = persistWithQuestions([structuredClone(USER_Q)]);
+  assert.equal(readiness.executionReadiness(pkg).answers, "NEEDS YOU");
+  const res = packages.updateApplicationPackageQuestion(pkg.id, pkg.packageHash, pkg.version, "q_user", "$180k base");
+  assert.equal(res.ok, true);
+  assert.equal(readiness.executionReadiness(res.package).answers, "NEEDS REVIEW");
+});
+
+// ---- ATS readiness sync ----
+
+function readinessPkg(over = {}) {
+  return {
+    atsType: over.atsType ?? "greenhouse",
+    canonicalApplyUrl: over.canonicalApplyUrl ?? "https://boards.greenhouse.io/acme/jobs/1",
+    questions: over.questions ?? [],
+    selectedResume: over.selectedResume ?? { status: "ready" },
+    status: over.status ?? "APPROVED",
+    approval: over.approval ?? { status: "approved", packageHash: "h" },
+    packageHash: over.packageHash ?? "h",
+    profileSnapshot: over.profileSnapshot ?? { version: 1, hash: "ph", reference: "r" },
+  };
+}
+
+test("readiness: Greenhouse is SUPPORTED and can be ready for live", () => {
+  const r = readiness.executionReadiness(readinessPkg({ atsType: "greenhouse" }));
+  assert.equal(r.atsSupport, "SUPPORTED");
+  assert.equal(r.ats, "SUPPORTED");
+  assert.equal(r.readyForLive, true);
+});
+
+test("readiness: Lever is SUPPORTED", () => {
+  const r = readiness.executionReadiness(readinessPkg({ atsType: "lever", canonicalApplyUrl: "https://jobs.lever.co/acme/abc" }));
+  assert.equal(r.atsSupport, "SUPPORTED");
+  assert.equal(r.readyForLive, true);
+});
+
+test("readiness: Ashby is SUPPORTED", () => {
+  const r = readiness.executionReadiness(readinessPkg({ atsType: "ashby", canonicalApplyUrl: "https://jobs.ashbyhq.com/acme/uuid" }));
+  assert.equal(r.atsSupport, "SUPPORTED");
+  assert.equal(r.readyForLive, true);
+});
+
+test("readiness: Workday is SUPPORTED", () => {
+  const r = readiness.executionReadiness(readinessPkg({ atsType: "workday", canonicalApplyUrl: "https://acme.wd5.myworkdayjobs.com/x/job/1" }));
+  assert.equal(r.atsSupport, "SUPPORTED");
+  assert.equal(r.readyForLive, true);
+});
+
+test("readiness: unknown ATS is MANUAL ASSIST and never ready for live auto-submit", () => {
+  const r = readiness.executionReadiness(readinessPkg({ atsType: "unknown", canonicalApplyUrl: "https://careers.acmecorp.com/apply/1" }));
+  assert.equal(r.atsSupport, "MANUAL_ASSIST");
+  assert.equal(r.ats, "MANUAL ASSIST");
+  assert.equal(r.readyForLive, false); // generic fallback is not equivalent to first-class support
+  assert.equal(readiness.atsSupport("unknown"), "MANUAL_ASSIST");
+});
+
+test("readiness: approval gating is unchanged (no approval → not ready for live)", () => {
+  const r = readiness.executionReadiness(readinessPkg({ atsType: "greenhouse", status: "READY_FOR_REVIEW", approval: undefined }));
+  assert.equal(r.approval, "REQUIRED");
+  assert.equal(r.readyForLive, false);
+});
+
+test("readiness: USER_REQUIRED answers block live readiness on a supported ATS", () => {
+  const r = readiness.executionReadiness(readinessPkg({ atsType: "greenhouse", questions: [structuredClone(USER_Q)] }));
+  assert.equal(r.answers, "NEEDS YOU");
+  assert.equal(r.readyForLive, false);
 });
