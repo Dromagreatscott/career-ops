@@ -197,7 +197,7 @@ function validateApplicationQuestion(value: unknown): boolean {
   if (!isRecord(value)) return false;
   if (!isString(value.id) || !isString(value.label) || !isString(value.explanation)) return false;
   if (value.classification !== "SAFE_AUTOFILL" && value.classification !== "REVIEW_REQUIRED" && value.classification !== "USER_REQUIRED") return false;
-  if (value.source !== "profile" && value.source !== "career_ops" && value.source !== "user") return false;
+  if (value.source !== "profile" && value.source !== "career_ops" && value.source !== "user" && value.source !== "ats") return false;
   if (value.value !== undefined && typeof value.value !== "string") return false;
   if (value.draft !== undefined && typeof value.draft !== "string") return false;
   return true;
@@ -715,6 +715,81 @@ export function updateApplicationPackageQuestion(
     updatedAt: nowIso(),
   });
   return { ok: true, package: writeApplicationPackage(next), changed: true };
+}
+
+function normalizeQuestionLabel(value: string): string {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+/** Deterministic id for a discovered ATS question, so re-runs dedupe by label. */
+function discoveredQuestionId(label: string): string {
+  return `ats_${crypto.createHash("sha1").update(normalizeQuestionLabel(label)).digest("hex").slice(0, 16)}`;
+}
+
+export type DiscoveredQuestion = {
+  label: string;
+  classification: QuestionClassification;
+  value?: string;
+};
+
+/**
+ * Persist ATS fields discovered during Dry Run into the canonical package questions
+ * so they surface in Application Review (no parallel answer store).
+ *
+ * - Only REVIEW_REQUIRED / USER_REQUIRED (and unknown-required promoted upstream to
+ *   REVIEW_REQUIRED) are surfaced; SAFE_AUTOFILL identity fields are never added as
+ *   manual work.
+ * - Deduped by normalized label AND deterministic id, so the same field is never
+ *   duplicated across dry runs (idempotent — no version churn once surfaced).
+ * - Adding fields is a material change: version bumps, approval is cleared, and
+ *   APPROVED/REJECTED resets to READY_FOR_REVIEW (David re-reviews the fuller form).
+ *   Sensitive classifications are preserved exactly — nothing is auto-answered.
+ */
+export function syncDiscoveredPackageQuestions(
+  packageId: string,
+  discovered: DiscoveredQuestion[],
+): { ok: true; package: ApplicationPackage; added: number; changed: boolean } | { ok: false; status: number; error: string } {
+  const read = readApplicationPackage(packageId);
+  if (!read.ok) return { ok: false, status: read.status, error: read.error };
+  const existing = read.package;
+
+  const existingLabels = new Set(existing.questions.map((question) => normalizeQuestionLabel(question.label)));
+  const existingIds = new Set(existing.questions.map((question) => question.id));
+  const additions: ApplicationQuestion[] = [];
+  const seen = new Set<string>();
+  for (const item of discovered) {
+    const label = String(item.label ?? "").trim();
+    if (!label) continue;
+    if (item.classification !== "REVIEW_REQUIRED" && item.classification !== "USER_REQUIRED") continue; // never surface SAFE_AUTOFILL as manual work
+    const id = discoveredQuestionId(label);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    // Reuse an existing package question (by label or id) rather than duplicating.
+    if (existingLabels.has(normalizeQuestionLabel(label)) || existingIds.has(id)) continue;
+    additions.push({
+      id,
+      label,
+      classification: item.classification,
+      value: typeof item.value === "string" && item.value.trim() ? item.value.trim() : undefined,
+      source: "ats",
+      explanation: "Discovered on the live ATS form during dry run — review or answer before submission.",
+    });
+  }
+  if (!additions.length) return { ok: true, package: existing, added: 0, changed: false };
+
+  const nextQuestions = [...existing.questions, ...additions];
+  const { packageHash: _packageHash, ...withoutHash } = existing;
+  const next = withHash({
+    ...withoutHash,
+    questions: nextQuestions,
+    packageIssues: packageIssues(nextQuestions, existing.selectedResume, existing.atsType),
+    status: existing.status === "APPROVED" || existing.status === "REJECTED" ? "READY_FOR_REVIEW" : existing.status,
+    approval: undefined,
+    version: existing.version + 1,
+    materialSummary: `${existing.materialSummary} Review reset: dry run surfaced ${additions.length} new ATS field(s).`,
+    updatedAt: nowIso(),
+  });
+  return { ok: true, package: writeApplicationPackage(next), added: additions.length, changed: true };
 }
 
 export function decideApplicationPackage(

@@ -9,6 +9,8 @@ import {
 import {
   readApplicationPackage,
   setApplicationPackageExecutionStatus,
+  syncDiscoveredPackageQuestions,
+  type DiscoveredQuestion,
 } from "../application-packages";
 import type {
   ApplicationBlockerCode,
@@ -19,7 +21,7 @@ import type {
 } from "../types";
 import { adapterForUrl, detectExecutionAts } from "./adapters";
 import { dryRunReport } from "./field-mapping";
-import type { ExecutionBlocker, InspectedApplication } from "./types";
+import type { ExecutionBlocker, FieldMapping, InspectedApplication } from "./types";
 
 export type ExecuteAction = "dry-run" | "start-live" | "resume" | "status";
 
@@ -62,6 +64,30 @@ export function assertExactApproval(pkg: ApplicationPackage, hash?: string, vers
   if (pkg.approval?.status !== "approved") return stale(409, "approved package decision is missing");
   if (pkg.approval.packageHash !== pkg.packageHash) return stale(409, "approval does not match current package hash");
   return null;
+}
+
+/**
+ * Convert dry-run field mappings into the discovered questions to surface in
+ * Application Review. Identity SAFE_AUTOFILL fields and file uploads are excluded;
+ * fields already resolved from the reusable/company answer libraries are excluded
+ * (they are reused there, not duplicated here). An unknown-required field with no
+ * value is surfaced as REVIEW_REQUIRED so David can supply it.
+ */
+function discoveredQuestionsFromMappings(mappings: FieldMapping[]): DiscoveredQuestion[] {
+  const out: DiscoveredQuestion[] = [];
+  for (const mapping of mappings) {
+    if (mapping.field.type === "file") continue;
+    // Already answerable — reuse rather than duplicate: an existing package question
+    // (incl. a previously surfaced+answered ATS field) or an approved library answer.
+    if (mapping.source === "package_question" || mapping.source === "answer_library" || mapping.source === "company_pack") continue;
+    const label = mapping.field.label || mapping.field.id;
+    if (mapping.classification === "REVIEW_REQUIRED" || mapping.classification === "USER_REQUIRED") {
+      out.push({ label, classification: mapping.classification, value: mapping.value });
+    } else if (mapping.status === "blocked" && mapping.blocker?.code === "UNKNOWN_REQUIRED_FIELD") {
+      out.push({ label, classification: "REVIEW_REQUIRED" });
+    }
+  }
+  return out;
 }
 
 function firstBlocker(blockers: ExecutionBlocker[]): ExecutionBlocker {
@@ -122,6 +148,11 @@ async function runSession(pkg: ApplicationPackage, session: ApplicationSession, 
   const report = adapter.report ? adapter.report(ctx, mappings, blockers) : dryRunReport(adapter.type, mappings, resumeBlocker ? "MISSING" : "READY", blockers);
 
   if (session.mode === "DRY_RUN") {
+    // Close the discovery loop: persist REVIEW_REQUIRED / USER_REQUIRED fields the
+    // real form exposed into the canonical package so they surface in Application
+    // Review (idempotent — no-op once already surfaced). Never final-submits.
+    const discovered = discoveredQuestionsFromMappings(mappings);
+    if (discovered.length) syncDiscoveredPackageQuestions(pkg.id, discovered);
     if (blockers.length) {
       const blocker = firstBlocker(blockers);
       const updated = markIntervention(session.id, blocker.code, blocker.message, blocker.action, report);

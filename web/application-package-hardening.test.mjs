@@ -16,6 +16,7 @@ const statusRoute = jiti("./src/app/api/status/route.ts");
 const readiness = jiti("./src/lib/command-center/execution-readiness.ts");
 const store = jiti("./src/lib/command-center/profile-store.ts");
 const fieldMapping = jiti("./src/lib/command-center/ats-executor/field-mapping.ts");
+const executor = jiti("./src/lib/command-center/ats-executor/executor.ts");
 
 function tempRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "career-ops-hardening-"));
@@ -575,4 +576,142 @@ test("changed canonical profile invalidates a prior approval (snapshot invalidat
   assert.equal(invalidated[0].status, "READY_FOR_REVIEW");
   assert.equal(invalidated[0].approval, undefined);
   assert.equal(invalidated[0].version, approved.package.version + 1);
+});
+
+// ---------------------------------------------------------------------------
+// Dry-run ATS discovery → Application Review surfacing (close the loop)
+// ---------------------------------------------------------------------------
+
+const IN_PERSON = "Are you open to working in-person in one of our offices 25% of the time?";
+const APPLY_URL = "https://boards.greenhouse.io/anthropic/jobs/123";
+
+function anthropicJob() {
+  return job({ id: "job-anthropic", company: "Anthropic", canonicalApplyUrl: APPLY_URL, sourceUrl: APPLY_URL });
+}
+function inspectedForm(fields) {
+  return { title: "Anthropic", url: APPLY_URL, issues: [], fields };
+}
+function standardForm() {
+  return inspectedForm([
+    { id: "first_name", label: "First Name", type: "text", required: true },
+    { id: "email", label: "Email", type: "email", required: true },
+    { id: "why", label: "Why do you want to work at Anthropic?", type: "textarea", required: false },
+    { id: "inperson", label: IN_PERSON, type: "text", required: true },
+    { id: "salary", label: "Desired salary", type: "text", required: true },
+  ]);
+}
+function dryRun(pkgId, inspected) {
+  return executor.executeApplicationPackage({ packageId: pkgId, action: "dry-run" }, { resolveDns: false, inspected });
+}
+function reread(pkgId) {
+  return packages.readApplicationPackage(pkgId).package;
+}
+function bySurfacedLabel(pkg, label) {
+  return pkg.questions.find((q) => q.label === label);
+}
+
+test("dry run surfaces a discovered USER_REQUIRED ATS field into Application Review", async () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const pkg = packages.prepareApplicationPackage(anthropicJob(), profile());
+  await dryRun(pkg.id, standardForm());
+  const q = bySurfacedLabel(reread(pkg.id), IN_PERSON);
+  assert.ok(q, "in-person field surfaced");
+  assert.equal(q.source, "ats");
+  assert.equal(q.classification, "USER_REQUIRED");
+});
+
+test("dry run surfaces a discovered REVIEW_REQUIRED ATS field", async () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const pkg = packages.prepareApplicationPackage(anthropicJob(), profile());
+  await dryRun(pkg.id, standardForm());
+  const q = bySurfacedLabel(reread(pkg.id), "Why do you want to work at Anthropic?");
+  assert.ok(q);
+  assert.equal(q.source, "ats");
+  assert.equal(q.classification, "REVIEW_REQUIRED");
+});
+
+test("SAFE_AUTOFILL identity fields are NOT surfaced as manual questions", async () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const pkg = packages.prepareApplicationPackage(anthropicJob(), profile());
+  await dryRun(pkg.id, standardForm());
+  const surfacedIdentity = reread(pkg.id).questions.filter((q) => q.source === "ats" && /first name|email/i.test(q.label));
+  assert.equal(surfacedIdentity.length, 0);
+});
+
+test("surfacing a discovered field invalidates prior approval and bumps version", async () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const pkg = packages.prepareApplicationPackage(anthropicJob(), profile());
+  const approved = packages.decideApplicationPackage(pkg.id, pkg.packageHash, pkg.version, "approved");
+  assert.equal(approved.ok, true);
+  await dryRun(pkg.id, standardForm());
+  const after = reread(pkg.id);
+  assert.equal(after.status, "READY_FOR_REVIEW");
+  assert.equal(after.approval, undefined);
+  assert.equal(after.version, approved.package.version + 1);
+});
+
+test("discovered fields are not duplicated across dry runs (idempotent)", async () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const pkg = packages.prepareApplicationPackage(anthropicJob(), profile());
+  await dryRun(pkg.id, standardForm());
+  const afterFirst = reread(pkg.id);
+  const countFirst = afterFirst.questions.length;
+  await dryRun(pkg.id, standardForm());
+  const afterSecond = reread(pkg.id);
+  assert.equal(afterSecond.questions.length, countFirst);
+  assert.equal(afterSecond.questions.filter((q) => q.label === IN_PERSON).length, 1);
+});
+
+test("answering a surfaced field persists and the next dry run reuses it (blocker removed)", async () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const pkg = packages.prepareApplicationPackage(anthropicJob(), profile());
+  await dryRun(pkg.id, standardForm());
+  let cur = reread(pkg.id);
+  const surfaced = bySurfacedLabel(cur, IN_PERSON);
+  const ans = packages.updateApplicationPackageQuestion(cur.id, cur.packageHash, cur.version, surfaced.id, "Yes");
+  assert.equal(ans.ok, true);
+  assert.equal(ans.changed, true);
+  const q = ans.package.questions.find((item) => item.id === surfaced.id);
+  assert.equal(q.value, "Yes");
+  assert.equal(q.classification, "REVIEW_REQUIRED"); // resolved, never SAFE_AUTOFILL
+  assert.equal(ans.package.version, cur.version + 1); // material edit bumps version
+
+  // Next dry run: the field now maps to the saved answer and no longer blocks.
+  const m = fieldMapping.mapPackageFields([{ id: "inperson", label: IN_PERSON, type: "text", required: true }], ans.package);
+  assert.equal(m[0].classification, "REVIEW_REQUIRED");
+  assert.equal(m[0].value, "Yes");
+  assert.equal(m[0].status, "mapped");
+  assert.equal(m[0].blocker, undefined);
+
+  // And re-running the dry run does not re-add the (now answered) field.
+  await dryRun(ans.package.id, standardForm());
+  assert.equal(reread(ans.package.id).questions.filter((item) => item.label === IN_PERSON).length, 1);
+});
+
+test("a discovered sensitive field stays USER_REQUIRED (no auto-answer)", async () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const pkg = packages.prepareApplicationPackage(anthropicJob(), profile());
+  await dryRun(pkg.id, standardForm());
+  const salary = bySurfacedLabel(reread(pkg.id), "Desired salary");
+  assert.ok(salary);
+  assert.equal(salary.classification, "USER_REQUIRED");
+  assert.equal(salary.value, undefined);
+});
+
+test("dry run with discovery never final-submits", async () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const pkg = packages.prepareApplicationPackage(anthropicJob(), profile());
+  const r = await dryRun(pkg.id, standardForm());
+  assert.equal(r.ok, true);
+  assert.equal(r.session.mode, "DRY_RUN");
+  assert.notEqual(r.session.status, "SUBMITTED");
+  assert.notEqual(reread(pkg.id).status, "SUBMITTED");
 });

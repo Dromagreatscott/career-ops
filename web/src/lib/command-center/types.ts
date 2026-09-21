@@ -303,7 +303,7 @@ export type ApplicationQuestion = {
   classification: QuestionClassification;
   value?: string;
   draft?: string;
-  source: "profile" | "career_ops" | "user";
+  source: "profile" | "career_ops" | "user" | "ats";
   explanation: string;
 };
 
