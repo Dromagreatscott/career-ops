@@ -14,6 +14,8 @@ const packages = jiti("./src/lib/command-center/application-packages.ts");
 const urls = jiti("./src/lib/security/url.ts");
 const statusRoute = jiti("./src/app/api/status/route.ts");
 const readiness = jiti("./src/lib/command-center/execution-readiness.ts");
+const store = jiti("./src/lib/command-center/profile-store.ts");
+const fieldMapping = jiti("./src/lib/command-center/ats-executor/field-mapping.ts");
 
 function tempRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "career-ops-hardening-"));
@@ -423,4 +425,154 @@ test("readiness: USER_REQUIRED answers block live readiness on a supported ATS",
   const r = readiness.executionReadiness(readinessPkg({ atsType: "greenhouse", questions: [structuredClone(USER_Q)] }));
   assert.equal(r.answers, "NEEDS YOU");
   assert.equal(r.readyForLive, false);
+});
+
+// ---------------------------------------------------------------------------
+// Canonical profile resolution: config/profile.yml → executor (source-of-truth)
+// ---------------------------------------------------------------------------
+
+const CANDIDATE_YAML = `candidate:
+  full_name: David Scott
+  email: david@example.com
+  phone: "+1-555-0100"
+  location: Remote, US
+  linkedin: https://linkedin.com/in/davidscott
+  github: https://github.com/davidscott
+  portfolio_url: https://davidscott.dev
+`;
+
+function seedConfigProfile(root, body = CANDIDATE_YAML) {
+  fs.mkdirSync(path.join(root, "config"), { recursive: true });
+  fs.writeFileSync(path.join(root, "config", "profile.yml"), body, "utf8");
+}
+
+function idPkg() {
+  return { userId: "career-ops-operator", profileScope: "career-ops", company: "Anthropic", questions: [] };
+}
+function mapValue(fields) {
+  return Object.fromEntries(fieldMapping.mapPackageFields(fields, idPkg()).map((m) => [m.field.id, m]));
+}
+
+test("canonical profile.yml resolves when data/web/profile.json is absent (live VPS state)", () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  assert.equal(fs.existsSync(path.join(root, "data", "web", "profile.json")), false);
+  const rec = store.readProfileRecord();
+  assert.equal(rec.personal.name.value, "David Scott");
+  assert.equal(rec.personal.name.verificationState, "verified");
+});
+
+test("First Name maps from David Scott", () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const m = mapValue([{ id: "first_name", label: "First Name", type: "text", required: true }]);
+  assert.equal(m.first_name.classification, "SAFE_AUTOFILL");
+  assert.equal(m.first_name.value, "David");
+});
+
+test("Last Name maps from David Scott", () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const m = mapValue([{ id: "last_name", label: "Last Name", type: "text", required: true }]);
+  assert.equal(m.last_name.value, "Scott");
+});
+
+test("full name / email / phone / linkedin / github / portfolio / location all map from canonical yml", () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const m = mapValue([
+    { id: "full_name", label: "Full Name", type: "text", required: false },
+    { id: "email", label: "Email", type: "email", required: true },
+    { id: "phone", label: "Phone", type: "tel", required: false },
+    { id: "linkedin", label: "LinkedIn Profile", type: "url", required: false },
+    { id: "github", label: "GitHub", type: "url", required: false },
+    { id: "portfolio", label: "Portfolio URL", type: "url", required: false },
+    { id: "location", label: "Location (City)", type: "text", required: false },
+  ]);
+  assert.equal(m.full_name.value, "David Scott");
+  assert.equal(m.email.value, "david@example.com");
+  assert.equal(m.phone.value, "+1-555-0100");
+  assert.equal(m.linkedin.value, "https://linkedin.com/in/davidscott");
+  assert.equal(m.github.value, "https://github.com/davidscott");
+  assert.equal(m.portfolio.value, "https://davidscott.dev");
+  assert.equal(m.location.value, "Remote, US");
+  for (const id of ["full_name", "email", "phone", "linkedin", "github", "portfolio", "location"]) {
+    assert.equal(m[id].classification, "SAFE_AUTOFILL");
+  }
+});
+
+test("sensitive fields remain USER_REQUIRED even with canonical identity present", () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const m = mapValue([
+    { id: "salary", label: "Desired salary", type: "text", required: true },
+    { id: "sponsor", label: "Will you require visa sponsorship?", type: "text", required: true },
+  ]);
+  assert.equal(m.salary.classification, "USER_REQUIRED");
+  assert.equal(m.sponsor.classification, "USER_REQUIRED");
+  assert.equal(m.salary.value, undefined);
+  assert.equal(store.readProfileRecord().compensation.preferredCompensation.verificationState, "missing");
+});
+
+test("unverified persisted field does NOT become SAFE_AUTOFILL", () => {
+  const root = useRoot();
+  seedConfigProfile(root, "candidate:\n  email: david@example.com\n"); // no full_name in canonical
+  fs.mkdirSync(path.join(root, "data", "web"), { recursive: true });
+  fs.writeFileSync(path.join(root, "data", "web", "profile.json"), JSON.stringify({
+    userId: "career-ops-operator", profileScope: "career-ops", version: 3,
+    personal: { name: { value: "Needs Review Name", verificationState: "needs_review" } },
+  }));
+  const rec = store.readProfileRecord();
+  assert.equal(rec.personal.name.verificationState, "needs_review");
+  const m = mapValue([{ id: "first_name", label: "First Name", type: "text", required: true }]);
+  assert.equal(m.first_name.value, undefined); // unverified → not autofilled
+});
+
+test("persisted verified override wins deterministically over canonical", () => {
+  const root = useRoot();
+  seedConfigProfile(root); // canonical email david@example.com
+  fs.mkdirSync(path.join(root, "data", "web"), { recursive: true });
+  fs.writeFileSync(path.join(root, "data", "web", "profile.json"), JSON.stringify({
+    userId: "career-ops-operator", profileScope: "career-ops", version: 5,
+    personal: { email: { value: "override@example.com", verificationState: "verified" } },
+  }));
+  const rec = store.readProfileRecord();
+  assert.equal(rec.personal.email.value, "override@example.com");
+  const m = mapValue([{ id: "email", label: "Email", type: "email", required: true }]);
+  assert.equal(m.email.value, "override@example.com");
+  // canonical fields the override didn't touch remain verified
+  assert.equal(rec.personal.name.value, "David Scott");
+});
+
+test("package snapshot hash uses the SAME resolved profile as the executor", () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const pkg = packages.prepareApplicationPackage(job(), profile());
+  assert.ok(pkg.profileSnapshot);
+  assert.equal(pkg.profileSnapshot.hash, store.profileHash(store.readProfileRecord("career-ops-operator", "career-ops")));
+});
+
+test("a canonical profile change alters the resolved hash (drives approval invalidation)", () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const before = store.profileHash(store.readProfileRecord());
+  seedConfigProfile(root, CANDIDATE_YAML.replace("david@example.com", "david.new@example.com"));
+  const after = store.profileHash(store.readProfileRecord());
+  assert.notEqual(before, after);
+});
+
+test("changed canonical profile invalidates a prior approval (snapshot invalidation intact)", () => {
+  const root = useRoot();
+  seedConfigProfile(root);
+  const pkg = packages.prepareApplicationPackage(job(), profile());
+  const approved = packages.decideApplicationPackage(pkg.id, pkg.packageHash, pkg.version, "approved");
+  assert.equal(approved.ok, true);
+  // Canonical identity changes → resolved profile hash changes → approval must drop.
+  seedConfigProfile(root, CANDIDATE_YAML.replace("David Scott", "David A. Scott"));
+  const newHash = store.profileHash(store.readProfileRecord(approved.package.userId ?? "career-ops-operator", approved.package.profileScope ?? "career-ops"));
+  const invalidated = packages.invalidatePackagesForProfileSnapshot(approved.package.userId ?? "career-ops-operator", approved.package.profileScope ?? "career-ops", newHash);
+  assert.equal(invalidated.length, 1);
+  assert.equal(invalidated[0].status, "READY_FOR_REVIEW");
+  assert.equal(invalidated[0].approval, undefined);
+  assert.equal(invalidated[0].version, approved.package.version + 1);
 });
