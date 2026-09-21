@@ -112,36 +112,110 @@ async function enrichFromAts(url: string, fields: ApplyField[]): Promise<void> {
 // the user's own Chrome on their residential IP (best ATS success); never submits.
 type Session = { id: string; url: string; title: string; fields: ApplyField[]; context: BrowserContext; page: Page; frame: Frame; createdAt: number; formShot?: string };
 
+export type BrowserMode = "headed" | "headless";
+
 declare global {
   // eslint-disable-next-line no-var
   var __coApplySessions: Map<string, Session> | undefined;
   // eslint-disable-next-line no-var
   var __coHeadedBrowser: Browser | undefined;
   // eslint-disable-next-line no-var
+  var __coBrowserMode: BrowserMode | undefined;
+  // eslint-disable-next-line no-var
   var __coIdleTimer: ReturnType<typeof setTimeout> | undefined;
 }
 const SESSIONS: Map<string, Session> = (globalThis.__coApplySessions ??= new Map());
 
-async function headedBrowser(): Promise<Browser> {
-  const b = globalThis.__coHeadedBrowser;
-  if (b && b.isConnected()) return b;
-  let nb: Browser;
-  try {
-    nb = await chromium.launch({
-      channel: "chrome",
-      headless: false,
-      args: ["--window-position=-3200,-3200", "--window-size=1280,940"], // off-screen during fill; moved on-screen at handoff
-    });
-  } catch {
-    // No system Google Chrome → fall back to Playwright's bundled Chromium if
-    // present; otherwise a clear, actionable error.
+/** True only where a visible browser window can actually be shown: macOS/Windows
+ *  have a native window server; Linux (our systemd/VPS target) needs an X or
+ *  Wayland display. No display → a headed browser cannot launch. */
+export function canUseHeadedBrowser(): boolean {
+  if (process.platform === "darwin" || process.platform === "win32") return true;
+  return Boolean(process.env.DISPLAY?.trim() || process.env.WAYLAND_DISPLAY?.trim());
+}
+
+/** Decide the browser mode for this environment.
+ *  CAREER_OPS_BROWSER=headed|headless forces it; otherwise "auto": headed only
+ *  where a display exists (local human handoff), else headless (server inspection
+ *  + dry run — the Ubuntu VPS/systemd case). */
+export function resolveBrowserMode(): BrowserMode {
+  const override = process.env.CAREER_OPS_BROWSER?.trim().toLowerCase();
+  if (override === "headed") return "headed";
+  if (override === "headless") return "headless";
+  return canUseHeadedBrowser() ? "headed" : "headless";
+}
+
+export type BrowserLaunchReason = "executable-missing" | "no-display" | "launch-failed";
+
+/** A browser-launch failure with a sanitized, category-specific message. NEVER
+ *  carries raw Playwright output (which includes absolute server paths). */
+export class BrowserLaunchError extends Error {
+  readonly reason: BrowserLaunchReason;
+  constructor(reason: BrowserLaunchReason, message: string) {
+    super(message);
+    this.name = "BrowserLaunchError";
+    this.reason = reason;
+  }
+}
+
+const LAUNCH_MESSAGES: Record<BrowserLaunchReason, string> = {
+  "executable-missing":
+    "Career Ops could not start its browser: Chromium is not installed for this service. Run `npx playwright install chromium`, and make sure the service user's HOME / PLAYWRIGHT_BROWSERS_PATH matches where it was installed.",
+  "no-display":
+    "A headed browser was requested but this server has no display. Server dry-run inspection uses headless mode; the on-screen human handoff must run on a machine with a screen.",
+  "launch-failed":
+    "Career Ops could not start its browser for this run. Check the server's Playwright/Chromium installation, then try again.",
+};
+
+/** Playwright's "the binary isn't there" family, matched WITHOUT surfacing the raw
+ *  message (which leaks paths). Kept broad but specific to install/spawn failures. */
+function isMissingExecutableError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /Executable doesn'?t exist|please run the following command|playwright install|npx playwright install|spawn[^\n]*ENOENT|ENOENT[^\n]*chrome|no such file or directory/i.test(message);
+}
+
+/** Classify a raw launch error into a sanitized BrowserLaunchError. Pure — unit
+ *  tested without launching a real browser. */
+export function classifyLaunchError(err: unknown, mode: BrowserMode, headedCapable: boolean = canUseHeadedBrowser()): BrowserLaunchError {
+  if (err instanceof BrowserLaunchError) return err;
+  if (isMissingExecutableError(err)) return new BrowserLaunchError("executable-missing", LAUNCH_MESSAGES["executable-missing"]);
+  if (mode === "headed" && !headedCapable) return new BrowserLaunchError("no-display", LAUNCH_MESSAGES["no-display"]);
+  return new BrowserLaunchError("launch-failed", LAUNCH_MESSAGES["launch-failed"]);
+}
+
+async function launchChromium(mode: BrowserMode): Promise<Browser> {
+  if (mode === "headed") {
+    // Prefer the user's real Chrome (residential fingerprint) for the local
+    // headed handoff; fall through to bundled Chromium if that channel is absent.
     try {
-      nb = await chromium.launch({ headless: false, args: ["--window-position=-3200,-3200", "--window-size=1280,940"] });
+      return await chromium.launch({ channel: "chrome", headless: false, args: ["--window-position=-3200,-3200", "--window-size=1280,940"] });
     } catch {
-      throw new Error("The apply feature needs Google Chrome. Install Chrome (or run: npx playwright install chromium) and try again.");
+      /* fall through to bundled chromium below */
+    }
+    try {
+      return await chromium.launch({ headless: false, args: ["--window-position=-3200,-3200", "--window-size=1280,940"] });
+    } catch (err) {
+      throw classifyLaunchError(err, "headed");
     }
   }
+  // Headless: no display needed. --no-sandbox / --disable-dev-shm-usage so it runs
+  // under systemd (and as root) in the VPS/container case.
+  try {
+    return await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+  } catch (err) {
+    throw classifyLaunchError(err, "headless");
+  }
+}
+
+/** Shared browser process for both server inspection/dry-run (headless) and the
+ *  local human handoff (headed). Mode is resolved once per launch. */
+async function sharedBrowser(): Promise<Browser> {
+  const b = globalThis.__coHeadedBrowser;
+  if (b && b.isConnected()) return b;
+  const mode = resolveBrowserMode();
+  const nb = await launchChromium(mode);
   globalThis.__coHeadedBrowser = nb;
+  globalThis.__coBrowserMode = mode;
   return nb;
 }
 
@@ -176,7 +250,7 @@ async function nudgeScroll(page: Page): Promise<void> {
 export async function openSession(url: string, cliId?: string, forceAgent?: boolean, noApplyBtn?: boolean): Promise<{ id: string; title: string; fields: ApplyField[]; shots: string[]; issues: ApplyIssue[]; needsDrive?: boolean }> {
   prune();
   if (globalThis.__coIdleTimer) clearTimeout(globalThis.__coIdleTimer); // someone's active
-  const browser = await headedBrowser();
+  const browser = await sharedBrowser();
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   context.setDefaultTimeout(8000); // no single action hangs the whole open/fill
   const page = await context.newPage();
@@ -290,7 +364,7 @@ export function getSession(id: string): Session | undefined {
  *  without the full extract pipeline. Caller must close the context. */
 export async function newDrivePage(url: string): Promise<{ page: Page; context: BrowserContext }> {
   if (globalThis.__coIdleTimer) clearTimeout(globalThis.__coIdleTimer);
-  const browser = await headedBrowser();
+  const browser = await sharedBrowser();
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   context.setDefaultTimeout(8000);
   const page = await context.newPage();
@@ -516,12 +590,25 @@ export async function fillSession(
   return { steps, navigated: endPath !== startPath, issues };
 }
 
+/** Whether an on-screen human handoff is possible right now: only when a headed
+ *  browser is (or would be) in use. On a headless server there is no window to
+ *  show, so callers must surface an explicit capability result — never pretend. */
+export function canHandoffToHuman(): boolean {
+  return (globalThis.__coBrowserMode ?? resolveBrowserMode()) === "headed";
+}
+
 /** Hand the real (now pre-filled) form to the HUMAN to review + submit. The
  *  window was kept OFF-SCREEN during fill, so bringToFront alone wouldn't make it
- *  visible — we reposition it on-screen via CDP first. We never submit. */
+ *  visible — we reposition it on-screen via CDP first. We never submit.
+ *
+ *  On a headless server there is no visible window: this is a safe no-op (the
+ *  form stays filled for a later headed session / manual finish) rather than a
+ *  misleading failure. Callers check canHandoffToHuman() to tell the human where
+ *  the handoff can actually happen. */
 export async function handoffSession(id: string): Promise<void> {
   const s = SESSIONS.get(id);
   if (!s) throw new Error("apply session not found");
+  if (!canHandoffToHuman()) return; // headless: nothing to raise on-screen here
   try {
     const cdp = await s.context.newCDPSession(s.page);
     const { windowId } = (await cdp.send("Browser.getWindowForTarget")) as { windowId: number };

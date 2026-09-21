@@ -8,7 +8,7 @@
     "build": "next build --webpack",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test-clean-chips.mjs application-package-hardening.test.mjs phase2-completion.test.mjs phase3-executor.test.mjs"
+    "test": "node --test test-clean-chips.mjs application-package-hardening.test.mjs phase2-completion.test.mjs phase3-executor.test.mjs apply-browser-runtime.test.mjs"
   },
   "dependencies": {
     "@paper-design/shaders-react": "^0.0.77",
