@@ -62,10 +62,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
           <WorkerPills />
 
-          <div className="mt-auto space-y-3 pt-4">
+          {/* pb clears the fixed bottom-left version / "Report a bug" bubble
+              (BetaBanner, z-[70]) so the theme control is never occluded. */}
+          <div className="mt-auto space-y-3 pt-4 pb-14">
             <UsageMeter />
-            <div className="flex items-center justify-between px-1">
-              <span className={`${instrumentSerif.className} text-sm text-faint`}>local-first · v0</span>
+            <div className="flex items-center justify-between gap-2 px-1">
+              <span className={`${instrumentSerif.className} shrink-0 text-sm text-faint`}>local-first · v0</span>
               <ThemeToggle />
             </div>
           </div>
